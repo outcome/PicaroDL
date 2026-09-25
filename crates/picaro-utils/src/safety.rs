@@ -160,27 +160,10 @@ pub fn scan_dangerous(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Optional ClamAV scan if `clamscan` is on PATH.
-/// Returns `Some(true)` = clean, `Some(false)` = infected, `None` = unavailable.
-pub fn clamav_scan(path: &Path) -> Option<bool> {
-    let out = std::process::Command::new("clamscan")
-        .arg("--no-summary")
-        .arg("--infected")
-        .arg(path)
-        .output()
-        .ok()?;
-    Some(out.status.success())
-}
-
-/// Reason a file is unsafe (executable/script content, or ClamAV detection).
+/// Reason a file is unsafe (executable/script content).
 pub fn danger_reason(path: &Path) -> Option<String> {
     if is_dangerous(path) {
         return Some("executable/script content".into());
-    }
-    if let Some(clean) = clamav_scan(path) {
-        if !clean {
-            return Some("ClamAV: malware detected".into());
-        }
     }
     None
 }

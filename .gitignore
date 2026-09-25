@@ -29,3 +29,6 @@ response*.txt
 
 # non-working (search-only / broken) modules, parked for now
 crates/picaro-modules/src/_disabled/
+
+# soulseek account (generated locally)
+soulseek_account.json

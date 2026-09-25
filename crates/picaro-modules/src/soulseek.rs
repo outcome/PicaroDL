@@ -139,12 +139,13 @@ struct SoulseekConstructor;
 
 impl ModuleConstructor for SoulseekConstructor {
     fn construct(&self, controller: ModuleController) -> Result<ModuleInterfacePtr> {
-        let config = SoulseekConfig::from_controller(&controller);
+        let (config, account_path) = SoulseekConfig::from_controller(&controller);
         Ok(Arc::new(SoulseekModule {
             controller,
             inner: Arc::new(SoulseekInner {
                 client: Mutex::new(None),
-                config,
+                config: Mutex::new(config),
+                account_path,
             }),
         }))
     }
@@ -181,13 +182,53 @@ fn env_u64(key: &str) -> Option<u64> {
     std::env::var(key).ok().and_then(|v| v.trim().parse().ok())
 }
 
+fn generate_creds() -> (String, String) {
+    (format!("picaro_{}", random_suffix(10)), random_suffix(16))
+}
+
+const ACCOUNT_FILE: &str = "soulseek_account.json";
+
+fn load_account(path: &Path) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let u = v.get("username")?.as_str()?.to_string();
+    let p = v.get("password")?.as_str()?.to_string();
+    if u.is_empty() || p.is_empty() {
+        None
+    } else {
+        Some((u, p))
+    }
+}
+
+fn save_account(path: &Path, username: &str, password: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let doc = json!({ "username": username, "password": password });
+    if let Ok(s) = serde_json::to_string_pretty(&doc) {
+        let _ = std::fs::write(path, s);
+    }
+}
+
 impl SoulseekConfig {
-    fn from_controller(controller: &ModuleController) -> Self {
-        // Guest credentials: Soulseek accepts any name/password pair, so a
-        // random per-instance name avoids colliding with a real account.
-        let username = env_string("PICARO_SOULSEEK_USERNAME")
-            .unwrap_or_else(|| format!("picaro_{}", random_suffix(10)));
-        let password = env_string("PICARO_SOULSEEK_PASSWORD").unwrap_or_else(|| random_suffix(16));
+    /// Build the config, generating and persisting guest credentials on first
+    /// use. Returns the config plus the account file path (`None` when explicit
+    /// credentials were provided through the environment).
+    fn from_controller(controller: &ModuleController) -> (Self, Option<PathBuf>) {
+        let account_path = controller.data_folder.join(ACCOUNT_FILE);
+        let env_user = env_string("PICARO_SOULSEEK_USERNAME");
+        let env_pass = env_string("PICARO_SOULSEEK_PASSWORD");
+        let explicit = env_user.is_some() && env_pass.is_some();
+        let (username, password) = if let (Some(u), Some(p)) = (env_user, env_pass) {
+            (u, p)
+        } else if let Some((u, p)) = load_account(&account_path) {
+            (u, p)
+        } else {
+            // First run: create a persistent account and remember it.
+            let (u, p) = generate_creds();
+            save_account(&account_path, &u, &p);
+            (u, p)
+        };
         let (server_host, server_port) = parse_server(
             &env_string("PICARO_SOULSEEK_SERVER")
                 .unwrap_or_else(|| DEFAULT_SERVER_HOST.to_string()),
@@ -202,22 +243,24 @@ impl SoulseekConfig {
                     .and_then(|p| u16::try_from(p).ok())
             })
             .unwrap_or(0);
-        // Port 0 asks the OS for an ephemeral port; `Listen::bind` also falls
-        // back to one if a fixed port is taken.
-        Self {
-            username,
-            password,
-            server_host,
-            server_port,
-            listen_port,
-            search_timeout: Duration::from_secs(
-                env_u64("PICARO_SOULSEEK_SEARCH_TIMEOUT").unwrap_or(DEFAULT_SEARCH_TIMEOUT_SECS),
-            ),
-            download_timeout: Duration::from_secs(
-                env_u64("PICARO_SOULSEEK_DOWNLOAD_TIMEOUT")
-                    .unwrap_or(DEFAULT_DOWNLOAD_TIMEOUT_SECS),
-            ),
-        }
+        (
+            Self {
+                username,
+                password,
+                server_host,
+                server_port,
+                listen_port,
+                search_timeout: Duration::from_secs(
+                    env_u64("PICARO_SOULSEEK_SEARCH_TIMEOUT")
+                        .unwrap_or(DEFAULT_SEARCH_TIMEOUT_SECS),
+                ),
+                download_timeout: Duration::from_secs(
+                    env_u64("PICARO_SOULSEEK_DOWNLOAD_TIMEOUT")
+                        .unwrap_or(DEFAULT_DOWNLOAD_TIMEOUT_SECS),
+                ),
+            },
+            if explicit { None } else { Some(account_path) },
+        )
     }
 }
 
@@ -237,7 +280,13 @@ struct SoulseekInner {
     /// Lazily connected session, reused across search/download calls. Reset and
     /// rebuilt on the next call if an operation reports a dead session.
     client: Mutex<Option<Client>>,
-    config: SoulseekConfig,
+    /// Credentials can be regenerated when the account is rejected (e.g. the
+    /// username was disabled after a long period of inactivity), so the config
+    /// sits behind a lock.
+    config: Mutex<SoulseekConfig>,
+    /// Where generated credentials are persisted. `None` when the caller
+    /// supplied explicit credentials through the environment.
+    account_path: Option<PathBuf>,
 }
 
 struct SoulseekModule {
@@ -400,15 +449,18 @@ fn file_to_search_result(user: &str, file: &SlskFile) -> SearchResult {
 // Session + network blocking helpers
 // ---------------------------------------------------------------------------
 
-fn connect_client(inner: &SoulseekInner) -> Result<Client> {
-    let cfg = &inner.config;
+fn try_login(inner: &SoulseekInner, username: String, password: String) -> Result<Client> {
+    let (host, port, listen_port) = {
+        let cfg = inner.config.lock();
+        (cfg.server_host.clone(), cfg.server_port, cfg.listen_port)
+    };
     let settings = ClientSettings {
-        username: cfg.username.clone(),
-        password: cfg.password.clone(),
-        server_address: PeerAddress::new(cfg.server_host.clone(), cfg.server_port),
+        username,
+        password,
+        server_address: PeerAddress::new(host, port),
         // We share nothing; the listener is only for inbound file transfers.
         enable_listen: true,
-        listen_port: cfg.listen_port,
+        listen_port,
         shared_directories: Vec::new(),
         accept_children: false,
         version: ClientVersion::default(),
@@ -426,6 +478,37 @@ fn connect_client(inner: &SoulseekInner) -> Result<Client> {
         ));
     }
     Ok(client)
+}
+
+/// Connect, logging in with the stored credentials. If the login is rejected
+/// (e.g. the account was disabled after a long period of inactivity, or the
+/// name collided), a fresh account is generated, persisted and retried once.
+fn connect_client(inner: &SoulseekInner) -> Result<Client> {
+    let (user, pass) = {
+        let cfg = inner.config.lock();
+        (cfg.username.clone(), cfg.password.clone())
+    };
+    match try_login(inner, user, pass) {
+        Ok(client) => Ok(client),
+        Err(first) => {
+            // Explicit env credentials must not be silently replaced.
+            let Some(path) = inner.account_path.clone() else {
+                return Err(first);
+            };
+            let (username, password) = generate_creds();
+            save_account(&path, &username, &password);
+            {
+                let mut cfg = inner.config.lock();
+                cfg.username = username.clone();
+                cfg.password = password.clone();
+            }
+            try_login(inner, username, password).map_err(|second| {
+                Error::Other(format!(
+                    "soulseek: login failed ({first}); retried with a fresh account and failed again ({second})"
+                ))
+            })
+        }
+    }
 }
 
 /// Run `op` against the cached session, connecting lazily. A session-level
@@ -452,7 +535,7 @@ fn with_client<T>(
 }
 
 fn search_blocking(inner: &SoulseekInner, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-    let timeout = inner.config.search_timeout;
+    let timeout = inner.config.lock().search_timeout;
     let results = with_client(inner, |client| client.search(query, timeout))?;
     let mut out: Vec<SearchResult> = Vec::new();
     'outer: for result in &results {
@@ -563,7 +646,8 @@ fn download_blocking(inner: &SoulseekInner, reference: SlskRef) -> Result<PathBu
         }
     };
 
-    let deadline = Instant::now() + inner.config.download_timeout;
+    let download_timeout = inner.config.lock().download_timeout;
+    let deadline = Instant::now() + download_timeout;
     loop {
         match status_rx.recv_timeout(Duration::from_secs(1)) {
             Ok(DownloadStatus::Completed) => break,
@@ -588,7 +672,7 @@ fn download_blocking(inner: &SoulseekInner, reference: SlskRef) -> Result<PathBu
                     }
                     return Err(Error::Other(format!(
                         "soulseek: download timed out after {}s",
-                        inner.config.download_timeout.as_secs()
+                        download_timeout.as_secs()
                     )));
                 }
             }

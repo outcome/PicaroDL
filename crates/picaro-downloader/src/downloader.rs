@@ -193,6 +193,18 @@ impl Downloader {
         }
     }
 
+    /// Choose the output folder for subsequent downloads. Created if missing -
+    /// handy for embedders that want a user-selected destination directory.
+    pub fn set_output_path(&mut self, path: PathBuf) {
+        let _ = std::fs::create_dir_all(&path);
+        self.output_path = path;
+    }
+
+    /// The output folder currently in use.
+    pub fn output_path(&self) -> &Path {
+        &self.output_path
+    }
+
     pub fn sender(&self) -> Sender<DownloadEvent> {
         self.events.0.clone()
     }
