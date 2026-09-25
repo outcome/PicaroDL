@@ -2,7 +2,7 @@
 
 A music downloader that doesn't ask you to sign in.
 
-PicaroDL started as a Rust port of [OrpheusDL](https://github.com/OrpheusDL/OrpheusDL).
+PicaroDL started as a Rust port of [OrpheusDL](https://github.com/OrfiTeam/OrpheusDL).
 OrpheusDL needs a login — and usually a paid subscription — to reach
 high-quality audio, and its downloads stop the moment the account or token does.
 PicaroDL took a different route. It no longer depends on accounts at all: it
