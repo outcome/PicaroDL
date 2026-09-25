@@ -1,0 +1,28 @@
+# build output
+target/
+
+# runtime data — may contain credentials and downloaded media.
+# Keep settings/logins LOCAL; never commit them.
+config/
+downloads/
+cache/
+temp/
+logs/
+
+# internal / AI-generated working notes (roadmap, design docs, agent notes)
+MODULES-ROADMAP.md
+QUALITY-RESOLUTION.md
+AGENTS.md
+CLAUDE.md
+*.ai.md
+notes/
+
+# scratch and debug dumps (may include tokens)
+*.tmp
+*.log
+response*.txt
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,136 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/picaro-core",
+    "crates/picaro-utils",
+    "crates/picaro-downloader",
+    "crates/picaro-tagging",
+    "crates/picaro-modules",
+    "crates/picaro-tui",
+    "crates/picaro",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["PicaroDL Contributors"]
+license = "MIT"
+description = "Modular music downloader (Rust rewrite of OrpheusDL)"
+repository = "https://github.com/picaro-rs/picaro-rs"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1.40", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# http
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "gzip", "brotli", "deflate", "cookies"], default-features = false }
+
+# serialisation
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "0.8"
+serde_derive_default = "0.1"
+indexmap = { version = "2.5", features = ["serde"] }
+
+# error
+thiserror = "1.0"
+anyhow = "1.0"
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# time
+chrono = { version = "0.4", features = ["serde"] }
+
+# filesystem / paths
+path-clean = "1.0"
+percent-encoding = "2.3"
+
+# crypto (Deezer Blowfish + JWT for Tidal)
+blowfish = "0.9"
+cbc = "0.1"
+cipher = { version = "0.4", features = ["block-padding"] }
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+hex = "0.4"
+jsonwebtoken = "9.3"
+
+# uuid for temp filenames
+uuid = { version = "1.10", features = ["v4"] }
+
+# regex
+regex = "1.10"
+
+# text sanitisation
+unicase = "2.7"
+
+# url
+url = "2.5"
+
+# tui
+ratatui = "0.28"
+crossterm = "0.28"
+
+# tagging
+lofty = "0.21"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+
+# derive
+enum_dispatch = "0.3"
+
+# process spawn (ffmpeg, mp4decrypt, etc.)
+which = "6.0"
+
+# byte / file utilities
+bytes = "1.7"
+filetime = "0.2"
+
+# cli arg parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# http types / mime
+mime = "0.3"
+http = "1.1"
+
+# rand
+rand = "0.8"
+
+# env
+dotenvy = "0.15"
+
+# temporary directories
+tempfile = "3.12"
+
+# qt codecs
+quick-xml = "0.36"
+
+# concurrent / parking
+parking_lot = "0.12"
+
+# bounded channel
+crossbeam-channel = "0.5"
+
+# 7z extraction
+sevenz-rust = "0.6"
+
+# derive more
+derive_more = "0.99"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = 1

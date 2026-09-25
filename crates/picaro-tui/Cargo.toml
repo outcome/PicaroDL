@@ -1,0 +1,32 @@
+[package]
+name = "picaro-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "TUI front-end (ratatui)"
+
+[dependencies]
+picaro-core = { path = "../picaro-core" }
+picaro-utils = { path = "../picaro-utils" }
+picaro-modules = { path = "../picaro-modules" }
+picaro-downloader = { path = "../picaro-downloader" }
+
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+parking_lot.workspace = true
+clap.workspace = true
+chrono.workspace = true
+url.workspace = true
+regex.workspace = true
+log = "0.4"
+crossbeam-channel.workspace = true
+indicatif = "0.17"
+futures.workspace = true

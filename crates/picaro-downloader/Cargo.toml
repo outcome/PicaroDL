@@ -1,0 +1,47 @@
+[package]
+name = "picaro-downloader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Download flow: track / album / playlist / artist / label"
+
+[dependencies]
+picaro-core = { path = "../picaro-core" }
+picaro-utils = { path = "../picaro-utils" }
+picaro-tagging = { path = "../picaro-tagging" }
+
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+parking_lot.workspace = true
+url.workspace = true
+regex.workspace = true
+percent-encoding.workspace = true
+uuid.workspace = true
+rand.workspace = true
+sha2.workspace = true
+md-5.workspace = true
+image.workspace = true
+clap.workspace = true
+chrono.workspace = true
+crossbeam-channel.workspace = true
+indicatif = "0.17"
+futures.workspace = true
+which.workspace = true
+tempfile.workspace = true
+blowfish.workspace = true
+cbc.workspace = true
+cipher.workspace = true
+sha1.workspace = true
+hex.workspace = true
+base64.workspace = true
+quick-xml.workspace = true
+sevenz-rust.workspace = true
+log = "0.4"
+env_logger = "0.11"
