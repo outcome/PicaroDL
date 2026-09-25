@@ -32,3 +32,5 @@ crates/picaro-modules/src/_disabled/
 
 # soulseek account (generated locally)
 soulseek_account.json
+picaro-windows-x86_64.exe
+*.AppImage

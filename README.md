@@ -43,10 +43,10 @@ Nothing waits on a slow source. Nothing asks you to log in.
 
 ## Providers
 
-The bundled sources are split by what's actually verified. Many FLAC blogs link
-third-party file hosts that are dead or captcha-gated, so PicaroDL ships only the
-sources that really download — plus keyless **MEGA** support and opt-in
-**Soulseek (P2P)**.
+The bundled sources are the ones that actually download. Many FLAC blogs link
+third-party file hosts that are dead or captcha-gated, so those sources are
+**disabled** (kept out of the build) rather than shipped broken. What's enabled is
+verified end-to-end, and includes keyless **MEGA** support and **Soulseek (P2P)**.
 
 - **Download verified** — PicaroDL fetched a real file end-to-end in testing.
 - **Search only** — search and metadata resolve, but the source's file host could
@@ -71,26 +71,7 @@ sources that really download — plus keyless **MEGA** support and opt-in
 | Deezer | MP3 (30s preview) | deezer.com (signed-out) |
 | FreeMP3Cloud | MP3 | freemp3cloud.com |
 | DanceMusic | MP3 | dance-music.org |
-
-### Search only (host-dependent)
-
-These resolve correctly but link to file hosts that are captcha-gated or dead
-(nitroflare, turbobit, hotlink, filecrypt, …), so they can't be fetched
-automatically. They stay in the tree for the day those hosts open up.
-
-| Provider | Format | Source |
-|---|---|---|
-| AlterPortal | FLAC | alterportal.net |
-| Exystence | FLAC | exystence.net |
-| FlacMusic | FLAC | flacmusic.info |
-| LosslessAlbums | FLAC | losslessalbums.club |
-| MusicRider | FLAC / MP3 | musicrider.org |
-| ThemFire | FLAC | themfire.pro |
-| Mp3db | MP3 | mp3db.pro |
-| DeadPulpit | MP3 | deadpulpit.com |
-| Butterboy | MP3 | butterboycompilations.blogspot.com |
-| Primitive Offerings | MP3 | primitiveofferings.blogspot.com |
-| iPlusfree | M4A (256 kbps AAC) | iplusfree.org |
+| FondSound | M4A | fondsound.com (MEGA) |
 
 ### Lyrics
 

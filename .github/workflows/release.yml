@@ -1,0 +1,50 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        run: copy target\release\picaro.exe picaro-windows-x86_64.exe
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: picaro-windows-x86_64.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      - name: Package AppImage
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick file wget
+          convert -size 256x256 xc:'#1B91DB' picaro.png
+          mkdir -p AppDir/usr/bin
+          cp target/release/picaro AppDir/usr/bin/picaro
+          printf '[Desktop Entry]\nName=PicaroDL\nExec=picaro\nIcon=picaro\nType=Application\nCategories=Audio;Utility;\nTerminal=true\n' > picaro.desktop
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          ./linuxdeploy-x86_64.AppImage --appimage-extract-and-run --appdir AppDir \
+            --executable AppDir/usr/bin/picaro \
+            --desktop-file picaro.desktop \
+            --icon-file picaro.png \
+            --output appimage
+          mv PicaroDL-*.AppImage picaro-linux-x86_64.AppImage || mv *.AppImage picaro-linux-x86_64.AppImage
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: picaro-linux-x86_64.AppImage

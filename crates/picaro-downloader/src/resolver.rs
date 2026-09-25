@@ -125,6 +125,7 @@ impl Resolver {
     fn default_chain(tier: QualityTier) -> Vec<&'static str> {
         match tier {
             QualityTier::Lossless => vec![
+                "soulseek",
                 "themfire",
                 "flacmusic",
                 "losslessalbums",
@@ -137,6 +138,7 @@ impl Resolver {
                 "alterportal",
             ],
             QualityTier::High => vec![
+                "soulseek",
                 "grimearchive",
                 "globaldjmix",
                 "zvu4it",
@@ -145,14 +147,42 @@ impl Resolver {
                 "freemp3cloud",
                 "iplusfree",
                 "mp3db",
-                "soundcloud",
+                "ezhevika",
                 "butterboy",
                 "punkcata",
-                "ezhevika",
                 "primitiveofferings",
                 "deadpulpit",
+                "soundcloud",
                 "youtube",
                 "deezerpreview",
+            ],
+            QualityTier::Medium => vec![
+                "zvu4it",
+                "tancpol",
+                "ezhevika",
+                "iplusfree",
+                "mp3db",
+                "ccmixter",
+                "butterboy",
+                "punkcata",
+                "primitiveofferings",
+                "deadpulpit",
+                "soundcloud",
+                "youtube",
+            ],
+            QualityTier::Low => vec![
+                "zvu4it",
+                "tancpol",
+                "ezhevika",
+                "mp3db",
+                "ccmixter",
+                "iplusfree",
+                "butterboy",
+                "punkcata",
+                "primitiveofferings",
+                "deadpulpit",
+                "soundcloud",
+                "youtube",
             ],
             QualityTier::Medium => vec![
                 "zvu4it",
@@ -218,10 +248,16 @@ impl Resolver {
                 .collect(),
         };
         let mut out: Vec<String> = list.into_iter().filter(|s| self.registered(s)).collect();
+        // Deprioritise Opus-only providers so a native codec wins when the
+        // source offers one; otherwise fall back to the self-tuning score.
         out.sort_by(|a, b| {
-            self.score_of(b)
-                .partial_cmp(&self.score_of(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let oa = is_opus_provider(a);
+            let ob = is_opus_provider(b);
+            oa.cmp(&ob).then_with(|| {
+                self.score_of(b)
+                    .partial_cmp(&self.score_of(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
         out
     }
@@ -453,7 +489,14 @@ fn is_direct_track(service: &str) -> bool {
             | "globaldjmix"
             | "freemp3cloud"
             | "deezerpreview"
+            | "soulseek"
     )
+}
+
+/// Providers that only ever deliver Opus (no native MP3/AAC/M4A alternative).
+/// The resolver deprioritises these so a native codec is chosen when available.
+fn is_opus_provider(service: &str) -> bool {
+    matches!(service, "youtube" | "soundcloud")
 }
 
 /// Score a search result against "artist - title" by token overlap.

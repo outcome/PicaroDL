@@ -385,6 +385,17 @@ pub fn default_global_settings() -> Map<String, Value> {
         }),
     );
     m.insert(
+        "conversion".to_string(),
+        json!({
+            // Optional ffmpeg transcode after download, e.g. to reach a desired
+            // codec or shrink a lossy file. Off by default.
+            "enabled": false,
+            "codec": "aac",
+            "bitrate_kbps": 192,
+            "only_if_larger": true
+        }),
+    );
+    m.insert(
         "covers".to_string(),
         json!({
             "embed_cover": true,

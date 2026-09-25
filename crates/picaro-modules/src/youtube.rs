@@ -348,6 +348,131 @@ fn parse_youtube_url(url: &str) -> Option<(String, String)> {
     None
 }
 
+const YTM_KEY: &str = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+const YTM_CLIENT_VERSION: &str = "1.20240101.01.00";
+
+fn ytm_runs_text(col: &Value) -> Option<String> {
+    col.pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_mmss(s: &str) -> Option<u32> {
+    let parts: Vec<&str> = s.trim().split(':').collect();
+    match parts.as_slice() {
+        [m, s] => Some(m.parse::<u32>().ok()? * 60 + s.parse::<u32>().ok()?),
+        [h, m, s] => Some(
+            h.parse::<u32>().ok()? * 3600 + m.parse::<u32>().ok()? * 60 + s.parse::<u32>().ok()?,
+        ),
+        _ => None,
+    }
+}
+
+fn parse_ytm_item(item: &Value) -> Option<SearchResult> {
+    let flex = item.get("flexColumns")?.as_array()?;
+    let title = flex.first().and_then(ytm_runs_text)?;
+    let artist = flex.get(1).and_then(ytm_runs_text);
+    let album = flex.get(2).and_then(ytm_runs_text);
+    let video_id = item
+        .pointer("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint/watchEndpoint/videoId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            item.pointer("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/videoId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })?;
+    let duration = item
+        .pointer("/fixedColumns/0/musicResponsiveListItemFixedColumnRenderer/text/runs/0/text")
+        .and_then(|v| v.as_str())
+        .and_then(parse_mmss);
+    let mut extra = serde_json::Map::new();
+    if let Some(a) = album {
+        extra.insert("album".to_string(), json!(a));
+    }
+    Some(SearchResult {
+        result_id: video_id,
+        name: Some(title),
+        artists: artist.map(|a| vec![a]),
+        duration,
+        extra_kwargs: extra,
+        ..Default::default()
+    })
+}
+
+fn collect_ytm(v: &Value, out: &mut Vec<SearchResult>, limit: usize) {
+    if out.len() >= limit {
+        return;
+    }
+    match v {
+        Value::Object(o) => {
+            if let Some(item) = o.get("musicResponsiveListItemRenderer") {
+                if let Some(sr) = parse_ytm_item(item) {
+                    out.push(sr);
+                }
+            }
+            for val in o.values() {
+                collect_ytm(val, out, limit);
+                if out.len() >= limit {
+                    return;
+                }
+            }
+        }
+        Value::Array(a) => {
+            for val in a {
+                collect_ytm(val, out, limit);
+                if out.len() >= limit {
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Search YouTube Music via YouTube's public InnerTube API (the approach the
+/// InnerTune client uses). Returns real songs (title/artist/album/duration)
+/// instead of raw video titles. No login required.
+async fn ytm_search(query: &str, limit: u32) -> Result<Vec<SearchResult>> {
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .build()
+        .unwrap_or_default();
+    let url =
+        format!("https://music.youtube.com/youtubei/v1/search?key={YTM_KEY}&prettyPrint=false");
+    let body = json!({
+        "context": { "client": { "clientName": "WEB_REMIX", "clientVersion": YTM_CLIENT_VERSION, "hl": "en" } },
+        "query": query
+    });
+    let resp = client
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::ORIGIN, "https://music.youtube.com")
+        .header(reqwest::header::REFERER, "https://music.youtube.com/")
+        .header("X-Goog-Api-Format-Version", "1")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("ytmusic search: {e}")))?;
+    if !resp.status().is_success() {
+        return Ok(Vec::new());
+    }
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| Error::Other(format!("ytmusic search read: {e}")))?;
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    let mut out = Vec::new();
+    collect_ytm(&v, &mut out, limit as usize);
+    tracing::info!(
+        "ytmusic search '{query}': len={} items={}",
+        text.len(),
+        out.len()
+    );
+    Ok(out)
+}
+
 #[async_trait]
 impl picaro_utils::module::ModuleInterface for YoutubeModule {
     fn name(&self) -> &str {
@@ -713,6 +838,16 @@ impl picaro_utils::module::ModuleInterface for YoutubeModule {
     ) -> Result<Vec<SearchResult>> {
         // Hard cap 50, mirroring interface.py's limit clamp.
         let limit = limit.clamp(1, 50);
+        // Prefer YouTube Music (InnerTune-style InnerTube) results for songs:
+        // they carry real artist/album metadata instead of raw video titles.
+        if matches!(query_type, DownloadType::track | DownloadType::album) {
+            if let Ok(mut r) = ytm_search(query, limit).await {
+                r.truncate(limit as usize);
+                if !r.is_empty() {
+                    return Ok(r);
+                }
+            }
+        }
         // yt-dlp only implements `ytsearchN:` — there is no `ytsearchplaylist`
         // or `ytsearchchannel` scheme. Mirror youtube_api.search instead:
         // videos via `ytsearch`, playlists via a filtered results URL

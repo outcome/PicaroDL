@@ -591,6 +591,8 @@ impl Downloader {
             }
         }
 
+        let dest = self.maybe_convert(dest, &globals).await;
+
         let _ = self.events.0.send(DownloadEvent::TrackSucceeded {
             track_id: track_id.to_string(),
             name: track_info.name.clone(),
@@ -636,6 +638,89 @@ impl Downloader {
             }
         }
         None
+    }
+
+    /// Optionally transcode a finished file to a target codec/bitrate via
+    /// ffmpeg. Configured under `[conversion]`; off by default. Returns the
+    /// (possibly new) path; on any failure the original file is kept.
+    async fn maybe_convert(&self, dest: PathBuf, globals: &GlobalSettings) -> PathBuf {
+        if !globals.get_bool_or("conversion", "enabled", false) {
+            return dest;
+        }
+        let codec = globals
+            .get_str_or("conversion", "codec", "aac")
+            .to_lowercase();
+        let target_ext = match codec.as_str() {
+            "aac" | "m4a" => "m4a",
+            "mp3" => "mp3",
+            "opus" => "opus",
+            "ogg" | "vorbis" => "ogg",
+            "flac" => "flac",
+            "wav" => "wav",
+            _ => {
+                self.log_warn(format!("conversion: unknown codec '{codec}'; skipping"));
+                return dest;
+            }
+        };
+        let cur_ext = dest
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if cur_ext == target_ext {
+            return dest;
+        }
+        let kbps = globals.get_int_or("conversion", "bitrate_kbps", 0).max(0) as u32;
+        let only_if_larger = globals.get_bool_or("conversion", "only_if_larger", true);
+        let ffmpeg_pref = globals.get_str_or("advanced", "ffmpeg_path", "ffmpeg");
+        let Some(ffmpeg) = picaro_utils::util::locate_ffmpeg(Some(ffmpeg_pref.as_str())) else {
+            self.log_warn("conversion: ffmpeg not found; keeping original".to_string());
+            return dest;
+        };
+        let encoder = match codec.as_str() {
+            "aac" | "m4a" => "aac",
+            "mp3" => "libmp3lame",
+            "opus" => "libopus",
+            "ogg" | "vorbis" => "libvorbis",
+            "flac" => "flac",
+            _ => "aac",
+        };
+        let out = dest.with_extension(target_ext);
+        let mut cmd = tokio::process::Command::new(&ffmpeg);
+        cmd.arg("-y")
+            .arg("-i")
+            .arg(&dest)
+            .arg("-map_metadata")
+            .arg("0")
+            .arg("-vn")
+            .arg("-c:a")
+            .arg(encoder);
+        if kbps > 0 && codec != "flac" {
+            cmd.arg("-b:a").arg(format!("{kbps}k"));
+        }
+        cmd.arg(&out);
+        match cmd.status().await {
+            Ok(s) if s.success() => {}
+            _ => {
+                let _ = tokio::fs::remove_file(&out).await;
+                self.log_warn(format!(
+                    "conversion: ffmpeg failed; keeping {}",
+                    dest.display()
+                ));
+                return dest;
+            }
+        }
+        // Only keep the transcode if it actually reduced the size.
+        if only_if_larger {
+            let so = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(u64::MAX);
+            let sd = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+            if so >= sd {
+                let _ = tokio::fs::remove_file(&out).await;
+                return dest;
+            }
+        }
+        let _ = tokio::fs::remove_file(&dest).await;
+        out
     }
 
     async fn download_track_cover(
@@ -1078,6 +1163,8 @@ impl Downloader {
         if let Some(c) = &cover_path {
             let _ = std::fs::remove_file(c);
         }
+
+        let dest = self.maybe_convert(dest, globals).await;
 
         let _ = self.events.0.send(DownloadEvent::TrackSucceeded {
             track_id: track_id.to_string(),
