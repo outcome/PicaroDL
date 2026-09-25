@@ -187,7 +187,7 @@ impl Downloader {
         }
 
         // 2b. Backfill missing metadata from keyless sources.
-        if globals.get_bool_or("metadata", "fill_missing", true) {
+        if globals.get_bool_or("metadata", "fill_misc", true) {
             let client = reqwest::Client::new();
             let filled =
                 picaro_utils::metadata_fill::fill_track_metadata(&client, &mut track_info).await;
@@ -226,18 +226,31 @@ impl Downloader {
                 service
             );
         }
-        if let Ok(lyrics) = module
-            .get_track_lyrics(
-                track_id,
-                track_info.lyrics_extra_kwargs.clone().into_iter().collect(),
-            )
-            .await
-        {
-            if let Some(l) = lyrics.embedded {
-                track_info.lyrics = Some(l);
+        // Lyrics: main module first, then registered lyrics providers.
+        if globals.get_bool_or("metadata", "fetch_lyrics", true) {
+            if let Ok(lyrics) = module
+                .get_track_lyrics(
+                    track_id,
+                    track_info.lyrics_extra_kwargs.clone().into_iter().collect(),
+                )
+                .await
+            {
+                if let Some(l) = lyrics.embedded {
+                    track_info.lyrics = Some(l);
+                }
+                if let Some(s) = lyrics.synced {
+                    track_info.synced_lyrics = Some(s);
+                }
             }
-            if let Some(s) = lyrics.synced {
-                track_info.synced_lyrics = Some(s);
+            if track_info.lyrics.is_none() && track_info.synced_lyrics.is_none() {
+                if let Some(l) = self.fetch_lyrics_from_providers(&track_info).await {
+                    if let Some(t) = l.embedded {
+                        track_info.lyrics = Some(t);
+                    }
+                    if let Some(s) = l.synced {
+                        track_info.synced_lyrics = Some(s);
+                    }
+                }
             }
         }
         let credits = module
@@ -413,14 +426,53 @@ impl Downloader {
         Ok(dest)
     }
 
+    /// Ask registered lyrics providers (LRCLIB, Lyrics.ovh, ...) for lyrics.
+    async fn fetch_lyrics_from_providers(
+        &self,
+        track: &TrackInfo,
+    ) -> Option<picaro_utils::models::LyricsInfo> {
+        let artist = track.artists.first().cloned().unwrap_or_default();
+        let mut data = HashMap::new();
+        data.insert("__artist__".to_string(), Value::String(artist));
+        data.insert(
+            "__track_name__".to_string(),
+            Value::String(track.name.clone()),
+        );
+        for name in self.picaro.list_modules() {
+            let is_lyrics = self
+                .picaro
+                .registry()
+                .get(&name)
+                .map(|m| {
+                    m.information
+                        .module_supported_modes
+                        .contains(ModuleModes::lyrics)
+                })
+                .unwrap_or(false);
+            if !is_lyrics {
+                continue;
+            }
+            if let Ok(module) = self.picaro.load_module(&name).await {
+                if let Ok(ly) = module.get_track_lyrics("", data.clone()).await {
+                    if ly.embedded.is_some() || ly.synced.is_some() {
+                        debug!("lyrics from provider {name}");
+                        return Some(ly);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     async fn download_track_cover(
         &self,
         module: &Arc<dyn picaro_utils::module::ModuleInterface>,
         track: &TrackInfo,
         globals: &GlobalSettings,
     ) -> Result<PathBuf> {
-        let embed = globals.get_bool_or("covers", "embed_cover", true);
-        if !embed {
+        let fetch = globals.get_bool_or("metadata", "fetch_cover", true)
+            && globals.get_bool_or("covers", "embed_cover", true);
+        if !fetch {
             return Err(Error::Other("covers disabled".into()));
         }
         let file_type = globals
@@ -550,7 +602,7 @@ impl Downloader {
             return Err(Error::Download(err.clone()));
         }
         // Backfill missing metadata from keyless sources.
-        if globals.get_bool_or("metadata", "fill_missing", true) {
+        if globals.get_bool_or("metadata", "fill_misc", true) {
             let client = reqwest::Client::new();
             let filled =
                 picaro_utils::metadata_fill::fill_track_metadata(&client, &mut track_info).await;
@@ -562,18 +614,30 @@ impl Downloader {
             .download_track_cover(&module, &track_info, globals)
             .await
             .ok();
-        if let Ok(lyrics) = module
-            .get_track_lyrics(
-                track_id,
-                track_info.lyrics_extra_kwargs.clone().into_iter().collect(),
-            )
-            .await
-        {
-            if let Some(l) = lyrics.embedded {
-                track_info.lyrics = Some(l);
+        if globals.get_bool_or("metadata", "fetch_lyrics", true) {
+            if let Ok(lyrics) = module
+                .get_track_lyrics(
+                    track_id,
+                    track_info.lyrics_extra_kwargs.clone().into_iter().collect(),
+                )
+                .await
+            {
+                if let Some(l) = lyrics.embedded {
+                    track_info.lyrics = Some(l);
+                }
+                if let Some(s) = lyrics.synced {
+                    track_info.synced_lyrics = Some(s);
+                }
             }
-            if let Some(s) = lyrics.synced {
-                track_info.synced_lyrics = Some(s);
+            if track_info.lyrics.is_none() && track_info.synced_lyrics.is_none() {
+                if let Some(l) = self.fetch_lyrics_from_providers(&track_info).await {
+                    if let Some(t) = l.embedded {
+                        track_info.lyrics = Some(t);
+                    }
+                    if let Some(s) = l.synced {
+                        track_info.synced_lyrics = Some(s);
+                    }
+                }
             }
         }
         let credits = module

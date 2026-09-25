@@ -3,16 +3,12 @@
 A music downloader that doesn't ask you to sign in.
 
 PicaroDL started as a Rust port of [OrpheusDL](https://github.com/OrpheusDL/OrpheusDL).
-OrpheusDL is a good program, but it's built around logging into streaming
-services — you bring an account, sometimes a paid one, and it does the rest.
-Somewhere along the way this project stopped being a port and turned into
-something else.
-
-The account-based modules are still here (Qobuz, Tidal, Deezer, Spotify,
-Beatport, Beatsource), but they're turned off by default, because none of them
-can actually download without credentials. What's enabled instead works with
-nothing: no accounts, no tokens, no API keys. You give it a song and it pulls
-from public sources, picking whichever one answers best and fastest.
+OrpheusDL needs a login — and usually a paid subscription — to reach
+high-quality audio, and its downloads stop the moment the account or token does.
+PicaroDL took a different route. It no longer depends on accounts at all: it
+pulls from public sources and needs no login, no tokens, and no API keys. Hand it
+a song and it queries the sources at once, keeps the best answer, and downloads
+it.
 
 ## How it behaves
 
@@ -85,10 +81,11 @@ Everything below works without an account.
 | Provider | Source |
 |---|---|
 | LRCLIB | lrclib.net |
+| Lyrics.ovh | lyrics.ovh |
+| Lyrist | lyrist.vercel.app |
 | Musixmatch | musixmatch.com |
 
-The account-only providers (Qobuz, Tidal, Deezer, Spotify, Beatport, Beatsource)
-are present in the source tree but disabled, and the resolver skips them.
+**23 modules total**, all usable without an account.
 
 ## Build
 
@@ -121,6 +118,17 @@ cargo build --release
 ```
 
 `--quality` takes `lossless`, `high`, `medium`, or `low`.
+
+## Toggles
+
+Three optional steps can be turned off independently in `config/settings.json`.
+All default to on.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `metadata.fetch_lyrics` | `true` | fetch and embed lyrics from the lyrics providers |
+| `metadata.fetch_cover` | `true` | download and embed album art |
+| `metadata.fill_misc` | `true` | fill missing artist / album / title / cover from free metadata services |
 
 ## Settings and privacy
 

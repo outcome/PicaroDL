@@ -48,17 +48,6 @@ enum Command {
     /// Print the global settings (defaults + user overrides).
     Settings,
 
-    /// Authenticate a module (email/password).
-    Login {
-        /// Module name (e.g. deezer, qobuz).
-        module: String,
-        /// Email or username.
-        email: String,
-        /// Password (omit to be prompted).
-        #[arg(short, long)]
-        password: Option<String>,
-    },
-
     /// Download a single track by id.
     Track {
         /// Service module name (e.g. qobuz, deezer).
@@ -179,24 +168,6 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Settings => {
             println!("{}", serde_json::to_string_pretty(&picaro.merged_globals)?);
-        }
-        Command::Login {
-            module,
-            email,
-            password,
-        } => {
-            let m = picaro.load_module(&module).await?;
-            let pw = match password {
-                Some(p) => p,
-                None => {
-                    eprint!("Password: ");
-                    let mut buf = String::new();
-                    std::io::stdin().read_line(&mut buf)?;
-                    buf.trim().to_string()
-                }
-            };
-            m.login(&email, &pw).await?;
-            println!("Logged in to {module}");
         }
         Command::Track { service, track_id } => {
             let downloader = make_downloader(picaro.clone(), &cli);
@@ -409,8 +380,7 @@ fn fmt_of(name: &str) -> &'static str {
         "ccmixter" | "mp3db" | "tancpol" | "zvu4it" | "soundclick" | "deadpulpit" | "butterboy"
         | "primitiveofferings" | "punkcata" | "ezhevika" | "discografias" => "MP3",
         "musicrider" | "intmusic" | "glorybeats" => "Mixed",
-        "qobuz" | "tidal" | "deezer" | "youtube" | "soundcloud" | "spotify" | "beatport"
-        | "beatsource" => "Stream",
+        "youtube" | "soundcloud" => "Stream",
         _ => "Unknown",
     }
 }

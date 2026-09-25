@@ -357,6 +357,14 @@ pub fn default_global_settings() -> Map<String, Value> {
         }),
     );
     m.insert(
+        "metadata".to_string(),
+        json!({
+            "fetch_lyrics": true,
+            "fetch_cover": true,
+            "fill_misc": true
+        }),
+    );
+    m.insert(
         "covers".to_string(),
         json!({
             "embed_cover": true,

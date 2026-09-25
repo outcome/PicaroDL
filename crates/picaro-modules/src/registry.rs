@@ -12,9 +12,6 @@ use picaro_utils::{ModuleConstructor, ModuleRegistry};
 
 pub static MODULE_INFO: Lazy<HashMap<String, ModuleInformation>> = Lazy::new(|| {
     let mut m: HashMap<String, ModuleInformation> = HashMap::new();
-    m.insert("qobuz".to_string(), crate::qobuz::module_information());
-    m.insert("tidal".to_string(), crate::tidal::module_information());
-    m.insert("deezer".to_string(), crate::deezer::module_information());
     m.insert("youtube".to_string(), crate::youtube::module_information());
     m.insert("lrclib".to_string(), crate::lrclib::module_information());
     m.insert(
@@ -22,16 +19,13 @@ pub static MODULE_INFO: Lazy<HashMap<String, ModuleInformation>> = Lazy::new(|| 
         crate::musixmatch::module_information(),
     );
     m.insert(
+        "lyrics_ovh".to_string(),
+        crate::lyrics_ovh::module_information(),
+    );
+    m.insert("lyrist".to_string(), crate::lyrist::module_information());
+    m.insert(
         "soundcloud".to_string(),
         crate::soundcloud::module_information(),
-    );
-    m.insert(
-        "beatport".to_string(),
-        crate::beatport::module_information(),
-    );
-    m.insert(
-        "beatsource".to_string(),
-        crate::beatsource::module_information(),
     );
     m.insert(
         "coreradio".to_string(),
@@ -45,7 +39,6 @@ pub static MODULE_INFO: Lazy<HashMap<String, ModuleInformation>> = Lazy::new(|| 
         "exystence".to_string(),
         crate::exystence::module_information(),
     );
-    m.insert("spotify".to_string(), crate::spotify::module_information());
     m.insert("mp3db".to_string(), crate::mp3db::module_information());
     m.insert(
         "themfire".to_string(),
@@ -142,16 +135,15 @@ pub fn register(
 }
 
 pub fn register_all(registry: &ModuleRegistry) -> Result<()> {
-    // DISABLED (download requires sign-in): qobuz, tidal, deezer
     crate::youtube::register_module(registry);
     crate::lrclib::register_module(registry);
     crate::musixmatch::register_module(registry);
+    crate::lyrics_ovh::register_module(registry);
+    crate::lyrist::register_module(registry);
     crate::soundcloud::register_module(registry);
-    // DISABLED (download requires sign-in): beatport, beatsource
     crate::coreradio::register_module(registry);
     crate::alterportal::register_module(registry);
     crate::exystence::register_module(registry);
-    // DISABLED (download requires sign-in): spotify
     crate::mp3db::register_module(registry);
     crate::themfire::register_module(registry);
     crate::flacmusic::register_module(registry);

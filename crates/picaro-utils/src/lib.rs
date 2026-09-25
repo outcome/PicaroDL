@@ -1,6 +1,5 @@
 //! The PicaroDL public library - re-exports everything that's stable.
 
-pub mod crypto;
 pub mod error;
 pub mod error_simplify;
 pub mod format;
