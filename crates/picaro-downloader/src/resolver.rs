@@ -189,7 +189,15 @@ impl Resolver {
             .unwrap_or(false)
     }
 
+    /// Restrict the resolver to a single provider (forced use / testing).
+    pub fn set_only(&mut self, service: Option<String>) {
+        self.allow = service.map(|s| vec![s.to_lowercase()]);
+    }
+
     fn chain_for(&self, tier: QualityTier) -> Vec<String> {
+        if let Some(a) = &self.allow {
+            return a.clone();
+        }
         let configured = self.tier_order.get(&tier);
         let list: Vec<String> = match configured {
             Some(v) if !v.is_empty() => v.clone(),
@@ -411,21 +419,17 @@ fn score_result(query: &str, r: &SearchResult) -> f64 {
         None => qt.clone(),
     };
     let s_full = textmatch::similarity(&full, &combined);
+    let s_artist = textmatch::similarity(&qt, &artists);
+    let s_title = textmatch::similarity(&qt, name);
     match &qa {
         Some(a) => {
-            let s_artist = r
-                .artists
-                .as_ref()
-                .map(|v| {
-                    v.iter()
-                        .map(|x| textmatch::similarity(a, x))
-                        .fold(0.0f64, f64::max)
-                })
-                .unwrap_or(0.0);
-            let s_title = textmatch::similarity(&qt, name);
-            0.4 * s_artist + 0.6 * s_full.max(s_title)
+            let a_match =
+                textmatch::similarity(a, &artists).max(textmatch::similarity(a, &combined));
+            0.5 * a_match + 0.5 * s_full.max(s_title)
         }
-        None => s_full,
+        // No explicit artist: accept if the query matches the artist, the
+        // title, or the combined string well.
+        None => s_full.max(s_artist).max(s_title),
     }
 }
 

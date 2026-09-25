@@ -180,23 +180,36 @@ impl picaro_utils::module::ModuleInterface for LrclibModule {
 
     async fn get_track_lyrics(
         &self,
-        _track_id: &str,
+        track_id: &str,
         data: HashMap<String, Value>,
     ) -> Result<LyricsInfo> {
-        // Mirrors interface.py get_track_lyrics: prefer embedded lyrics_data,
-        // else fetch by LRCLIB id (api/get/{id}).
-        let lyrics = if let Some(d) = data.get("lyrics_data") {
-            Some(d.clone())
-        } else if !_track_id.is_empty() {
-            let client = reqwest::Client::new();
-            let url = format!("https://lrclib.net/api/get/{}", urlencoded(_track_id));
-            match client.get(&url).send().await {
-                Ok(resp) if resp.status().is_success() => resp.json::<Value>().await.ok(),
-                _ => None,
+        // 1) embedded lyrics_data from a prior search, 2) fetch by LRCLIB id,
+        // 3) query by artist/title (used by the downloader's provider fallback).
+        let client = reqwest::Client::new();
+        let mut lyrics = data.get("lyrics_data").cloned();
+        if lyrics.is_none() && !track_id.is_empty() {
+            let url = format!("https://lrclib.net/api/get/{}", urlencoded(track_id));
+            if let Ok(resp) = client.get(&url).send().await {
+                if resp.status().is_success() {
+                    lyrics = resp.json::<Value>().await.ok();
+                }
             }
-        } else {
-            None
-        };
+        }
+        if lyrics.is_none() {
+            let artist = data
+                .get("__artist__")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let title = data
+                .get("__track_name__")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !artist.is_empty() && !title.is_empty() {
+                if let Ok(Some(v)) = Self::try_get(&client, title, artist, None, None).await {
+                    lyrics = Some(v);
+                }
+            }
+        }
         let Some(lyrics) = lyrics else {
             return Ok(LyricsInfo::default());
         };

@@ -39,6 +39,11 @@ pub fn is_hoster(url: &str) -> bool {
                 | "uploadbox.com"
                 | "turbobit.net"
                 | "nitroflare.com"
+                | "disk.yandex.ru"
+                | "disk.yandex.com"
+                | "yadi.sk"
+                | "imagenetz.de"
+                | "send.now"
         )
     )
 }
@@ -53,8 +58,10 @@ pub async fn resolve(client: &reqwest::Client, url: &str, referer: &str) -> Opti
     match host.as_str() {
         "mediafire.com" => resolve_mediafire(client, url, referer).await,
         "1fichier.com" => resolve_1fichier(client, url, referer).await,
+        "disk.yandex.ru" | "disk.yandex.com" | "yadi.sk" => resolve_yandex(client, url).await,
         // Recognised but captcha / JS gated: do not attempt to bypass.
-        "hotlink.cc" | "nfile.cc" | "uploadbox.com" | "turbobit.net" | "nitroflare.com" => {
+        "hotlink.cc" | "nfile.cc" | "uploadbox.com" | "turbobit.net" | "nitroflare.com"
+        | "imagenetz.de" | "send.now" => {
             info!("hoster {host}: unsupported (captcha/JS gated); keeping original URL");
             None
         }
@@ -129,6 +136,36 @@ async fn resolve_mediafire(client: &reqwest::Client, url: &str, referer: &str) -
     }
     warn!("mediafire: no direct link found (dead/private file?); keeping original URL");
     None
+}
+
+/// Yandex Disk public share (`disk.yandex.ru/d/<key>`). The public REST API is
+/// keyless: it returns a direct, time-limited download `href`.
+async fn resolve_yandex(client: &reqwest::Client, url: &str) -> Option<String> {
+    let resp = client
+        .get("https://cloud-api.yandex.net/v1/disk/public/resources/download")
+        .query(&[("public_key", url)])
+        .header(reqwest::header::USER_AGENT, BROWSER_UA)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        warn!(
+            "yandex: public API HTTP {} (private/expired?)",
+            resp.status()
+        );
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    match v.get("href").and_then(|h| h.as_str()) {
+        Some(href) if !href.is_empty() => {
+            info!("yandex: resolved direct link");
+            Some(href.to_string())
+        }
+        _ => {
+            warn!("yandex: no href in public API response");
+            None
+        }
+    }
 }
 
 /// 1fichier direct-download host: `https://a-18-4.1fichier.com/…` (always has a

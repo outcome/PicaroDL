@@ -121,6 +121,9 @@ crossbeam-channel = "0.5"
 # 7z extraction
 sevenz-rust = "0.6"
 
+# zip extraction
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
 # derive more
 derive_more = "0.99"
 

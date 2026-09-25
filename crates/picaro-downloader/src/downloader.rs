@@ -27,22 +27,92 @@ async fn is_7z_archive(path: &Path) -> bool {
     }
 }
 
-fn find_first_flac(dir: &Path) -> Option<PathBuf> {
+fn is_zip_archive(path: &Path) -> bool {
+    std::fs::read(path)
+        .map(|b| b.len() >= 4 && &b[0..2] == b"PK")
+        .unwrap_or(false)
+}
+
+fn is_audio_ext(path: &Path) -> bool {
+    path.extension().map_or(false, |e| {
+        matches!(
+            e.to_str().unwrap_or("").to_ascii_lowercase().as_str(),
+            "flac"
+                | "mp3"
+                | "m4a"
+                | "aac"
+                | "ogg"
+                | "oga"
+                | "opus"
+                | "wav"
+                | "aiff"
+                | "aif"
+                | "ape"
+                | "wv"
+        )
+    })
+}
+
+/// First audio file under `dir`, preferring FLAC.
+fn find_first_audio(dir: &Path) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
+    let mut first: Option<PathBuf> = None;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if let Some(p) = find_first_flac(&path) {
-                return Some(p);
+            if let Some(p) = find_first_audio(&path) {
+                if first.is_none() {
+                    first = Some(p);
+                }
             }
-        } else if path
-            .extension()
-            .map_or(false, |ext| ext.eq_ignore_ascii_case("flac"))
-        {
-            return Some(path);
+        } else if is_audio_ext(&path) {
+            if path
+                .extension()
+                .map_or(false, |e| e.eq_ignore_ascii_case("flac"))
+            {
+                return Some(path);
+            }
+            if first.is_none() {
+                first = Some(path);
+            }
         }
     }
-    None
+    first
+}
+
+/// Extract a zip archive into `out`, skipping traversal-unsafe entries.
+async fn extract_zip(archive: &Path, out: &Path) -> Result<()> {
+    let archive = archive.to_path_buf();
+    let out = out.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let f =
+            std::fs::File::open(&archive).map_err(|e| Error::Download(format!("zip open: {e}")))?;
+        let mut z =
+            zip::ZipArchive::new(f).map_err(|e| Error::Download(format!("zip read: {e}")))?;
+        for i in 0..z.len() {
+            let mut entry = match z.by_index(i) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if entry.is_dir() {
+                continue;
+            }
+            let rel = match entry.enclosed_name() {
+                Some(p) => p.to_path_buf(),
+                None => continue,
+            };
+            let target = out.join(&rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            if let Ok(mut w) = std::fs::File::create(&target) {
+                std::io::copy(&mut entry, &mut w).ok();
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| Error::Download(format!("zip join: {e}")))?
 }
 
 /// A download event sent to the TUI. The TUI subscribes to a channel and
@@ -331,9 +401,15 @@ impl Downloader {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_string();
-                let url = crate::hosters::resolve(&client, &url, &referer)
-                    .await
-                    .unwrap_or(url);
+                let resolved = crate::hosters::resolve(&client, &url, &referer).await;
+                // A resolved direct link must not carry the module's foreign
+                // Referer (some hosts, e.g. Yandex Disk, 403 on it).
+                let headers = if resolved.is_some() {
+                    reqwest::header::HeaderMap::new()
+                } else {
+                    headers
+                };
+                let url = resolved.unwrap_or(url);
                 download_to_path(
                     &client,
                     &url,
@@ -564,7 +640,7 @@ impl Downloader {
                 }
                 Err(e) => {
                     failed += 1;
-                    self.log_err(format!("track {id} failed: {e}"));
+                    warn!("track {id} failed: {e}");
                     let _ = self.events.0.send(DownloadEvent::TrackFailed {
                         track_id: id.to_string(),
                         name: id.to_string(),
@@ -713,9 +789,15 @@ impl Downloader {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_string();
-                let url = crate::hosters::resolve(&client, &url, &referer)
-                    .await
-                    .unwrap_or(url);
+                let resolved = crate::hosters::resolve(&client, &url, &referer).await;
+                // A resolved direct link must not carry the module's foreign
+                // Referer (some hosts, e.g. Yandex Disk, 403 on it).
+                let headers = if resolved.is_some() {
+                    reqwest::header::HeaderMap::new()
+                } else {
+                    headers
+                };
+                let url = resolved.unwrap_or(url);
                 download_to_path(
                     &client,
                     &url,
@@ -761,7 +843,35 @@ impl Downloader {
             if let Some(c) = &cover_path {
                 let _ = std::fs::remove_file(c);
             }
-            if let Some(p) = find_first_flac(&extract_to) {
+            if let Some(p) = find_first_audio(&extract_to) {
+                let _ = self.events.0.send(DownloadEvent::TrackSucceeded {
+                    track_id: track_id.to_string(),
+                    name: track_info.name.clone(),
+                    location: p.clone(),
+                    bytes,
+                });
+                return Ok(p);
+            }
+            return Ok(extract_to);
+        }
+        if is_zip_archive(&dest) {
+            let extract_to = dest
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| self.output_path.clone());
+            extract_zip(&dest, &extract_to).await?;
+            let removed = picaro_utils::safety::purge_non_audio(&extract_to);
+            if !removed.is_empty() {
+                self.log_warn(format!(
+                    "removed {} non-audio file(s) from archive",
+                    removed.len()
+                ));
+            }
+            let _ = tokio::fs::remove_file(&dest).await;
+            if let Some(c) = &cover_path {
+                let _ = std::fs::remove_file(c);
+            }
+            if let Some(p) = find_first_audio(&extract_to) {
                 let _ = self.events.0.send(DownloadEvent::TrackSucceeded {
                     track_id: track_id.to_string(),
                     name: track_info.name.clone(),
@@ -883,7 +993,7 @@ impl Downloader {
                 }
                 Err(e) => {
                     failed += 1;
-                    self.log_err(format!("track {id} failed: {e}"));
+                    warn!("track {id} failed: {e}");
                 }
             }
         }

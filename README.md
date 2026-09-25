@@ -22,7 +22,7 @@ Nothing waits on a slow source. Nothing asks you to log in.
 
 ## What's in it
 
-- **No sign-in anywhere in the default path.** The 21 enabled providers need no
+- **No sign-in anywhere in the default path.** The 23 bundled providers need no
   accounts.
 - **Multi-source resolver.** Sources are raced in parallel, scored for relevance,
   and tried in a sensible order that updates itself as you use it.
@@ -38,45 +38,46 @@ Nothing waits on a slow source. Nothing asks you to log in.
 - **Portable.** Pure Rust with `reqwest`, so it builds for desktop and
   cross-compiles to Android.
 
-## Providers (enabled by default)
+## Providers
 
-Everything below works without an account.
+23 modules are bundled and usable without an account. Whether a music source can
+actually *download* depends on the third-party file host it links to — some hosts
+are dead, paywalled, or captcha-gated. The tables are honest about it:
 
-**Lossless — FLAC**
+- **Download verified** — PicaroDL fetched a real file end-to-end in testing.
+- **Search only** — search and metadata resolve, but the source's file host could
+  not be downloaded automatically.
 
-| Provider | Source |
-|---|---|
-| CoreRadio | coreradio.online |
-| AlterPortal | alterportal.net |
-| Exystence | exystence.net |
-| ThemFire | themfire.pro |
-| FlacMusic | flacmusic.info |
-| LosslessAlbums | losslessalbums.club |
-| MusicRider | musicrider.org (FLAC / MP3) |
-
-**MP3**
-
-| Provider | Source |
-|---|---|
-| ccMixter | ccmixter.org (320 kbps) |
-| Mp3db | mp3db.pro |
-| Zvu4it | zvu4it.org |
-| Tancpol | tancpol.net |
-| DeadPulpit | deadpulpit.com |
-| Punkcata | punkcata.blogspot.com |
-| Ezhevika | ezhevika.blogspot.com |
-| Butterboy | butterboycompilations.blogspot.com |
-| Primitive Offerings | primitiveofferings.blogspot.com |
-
-**Other formats**
+### Download verified
 
 | Provider | Format | Source |
 |---|---|---|
-| iPlusfree | M4A (256 kbps AAC) | iplusfree.org |
 | YouTube | Opus (stream) | youtube.com |
 | SoundCloud | Opus (stream) | soundcloud.com |
+| CoreRadio | FLAC | coreradio.online |
+| ccMixter | MP3 | ccmixter.org |
+| Zvu4it | MP3 | zvu4it.org |
+| Tancpol | MP3 | tancpol.net |
+| Punkcata | MP3 | punkcata.blogspot.com |
 
-**Lyrics**
+### Search only (host-dependent)
+
+| Provider | Format | Source |
+|---|---|---|
+| AlterPortal | FLAC | alterportal.net |
+| Exystence | FLAC | exystence.net |
+| FlacMusic | FLAC | flacmusic.info |
+| LosslessAlbums | FLAC | losslessalbums.club |
+| MusicRider | FLAC / MP3 | musicrider.org |
+| ThemFire | FLAC | themfire.pro |
+| Mp3db | MP3 | mp3db.pro |
+| DeadPulpit | MP3 | deadpulpit.com |
+| Ezhevika | MP3 | ezhevika.blogspot.com |
+| Butterboy | MP3 | butterboycompilations.blogspot.com |
+| Primitive Offerings | MP3 | primitiveofferings.blogspot.com |
+| iPlusfree | M4A (256 kbps AAC) | iplusfree.org |
+
+### Lyrics
 
 | Provider | Source |
 |---|---|
@@ -85,7 +86,9 @@ Everything below works without an account.
 | Lyrist | lyrist.vercel.app |
 | Musixmatch | musixmatch.com |
 
-**23 modules total**, all usable without an account.
+> The "search only" sources work whenever their file hosts are up and
+> auto-resolvable. MediaFire and Yandex Disk links resolve automatically;
+> captcha-gated hosts (nitroflare, turbobit, hotlink, filecrypt) do not.
 
 ## Build
 

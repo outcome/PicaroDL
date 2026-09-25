@@ -264,7 +264,7 @@ fn parse_cover(html: &str) -> Option<String> {
 
 fn parse_file_host_link(html: &str) -> Option<String> {
     let re = Regex::new(
-        r#"href="(https?://[^"]*(?:mediafire|mega|zippyshare|1fichier|drive\.google|dropbox|pixeldrain|gofile|archive\.org)[^"]*)""#,
+        r#"href="(https?://[^"]*(?:mediafire|mega|zippyshare|1fichier|drive\.google|dropbox|pixeldrain|gofile|archive\.org|yandex|imagenetz|send\.now|katfile|rapidgator|ddownload)[^"]*)""#,
     )
     .unwrap();
     re.captures(html)

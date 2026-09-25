@@ -101,7 +101,13 @@ enum Command {
         /// Only resolve (print the winning source) without downloading.
         #[arg(long)]
         resolve_only: bool,
+        /// Restrict to a single provider (e.g. flacmusic).
+        #[arg(long)]
+        only: Option<String>,
     },
+
+    /// Query every lyrics provider for "artist - title".
+    Lyrics { query: String },
 
     /// Benchmark sources against a fixed query set (timing + result counts).
     Benchmark {
@@ -239,10 +245,61 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 println!("{:<8}  {:<48}  {}{}", r.result_id, title, artists, dur);
             }
         }
+        Command::Lyrics { query } => {
+            use picaro_utils::models::ModuleModes;
+            let (artist, title) = match query.find(" - ") {
+                Some(i) => (
+                    query[..i].trim().to_string(),
+                    query[i + 3..].trim().to_string(),
+                ),
+                None => (String::new(), query.trim().to_string()),
+            };
+            let mut data: std::collections::HashMap<String, serde_json::Value> =
+                std::collections::HashMap::new();
+            data.insert("__artist__".into(), serde_json::Value::String(artist));
+            data.insert("__track_name__".into(), serde_json::Value::String(title));
+            let mut any = false;
+            for name in picaro.list_modules() {
+                let is_lyrics = picaro
+                    .registry()
+                    .get(&name)
+                    .map(|m| {
+                        m.information
+                            .module_supported_modes
+                            .contains(ModuleModes::lyrics)
+                    })
+                    .unwrap_or(false);
+                if !is_lyrics {
+                    continue;
+                }
+                match picaro.load_module(&name).await {
+                    Ok(m) => match m.get_track_lyrics("", data.clone()).await {
+                        Ok(l) => {
+                            let n = l.embedded.as_deref().map_or(0, str::len)
+                                + l.synced.as_deref().map_or(0, str::len);
+                            println!(
+                                "{:<12} {:<6} {} chars{}",
+                                m.name(),
+                                if n > 0 { "OK" } else { "EMPTY" },
+                                n,
+                                if l.synced.is_some() { " (synced)" } else { "" }
+                            );
+                            any |= n > 0;
+                        }
+                        Err(e) => println!("{:<12} ERR    {e}", m.name()),
+                    },
+                    Err(e) => println!("{name:<12} LOAD ERR {e}"),
+                }
+            }
+            if !any {
+                println!("no lyrics found for '{query}'");
+            }
+        }
         Command::Get {
             query,
             quality,
             resolve_only,
+            only,
         } => {
             let tier = picaro_utils::quality::QualityTier::parse(&quality).ok_or_else(|| {
                 anyhow::anyhow!("invalid quality '{quality}' (lossless|high|medium|low)")
@@ -251,6 +308,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 picaro.clone(),
                 PathBuf::from("cache/providers.json"),
             );
+            resolver.set_only(only);
             if resolve_only {
                 match resolver.resolve(&query, tier).await {
                     Ok(r) => println!("{} [{}] -> {}", r.service, r.tier.as_str(), r.result_id),

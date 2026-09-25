@@ -188,7 +188,7 @@ impl picaro_utils::module::ModuleInterface for CcMixterModule {
                 different_codec: Some(CodecFlags::FLAC),
             });
         }
-        if track_id.starts_with("https://") {
+        if track_id.starts_with("http://") || track_id.starts_with("https://") {
             let mut headers = serde_json::Map::new();
             headers.insert("Referer".to_string(), json!(REFERER));
             return Ok(TrackDownloadInfo {
@@ -199,8 +199,31 @@ impl picaro_utils::module::ModuleInterface for CcMixterModule {
                 different_codec: Some(CodecFlags::MP3),
             });
         }
+        // The id is "user/<upload_id>" (or a bare id): resolve it to a direct
+        // file URL via the API before giving up.
+        let upload_id = track_id.rsplit('/').next().unwrap_or(track_id).trim();
+        if !upload_id.is_empty() {
+            let url = format!("https://ccmixter.org/api/query?f=json&ids={upload_id}");
+            if let Ok(resp) = self.client.get(&url).send().await {
+                if let Ok(v) = resp.json::<Value>().await {
+                    if let Some(item) = v.as_array().and_then(|a| a.first()) {
+                        if let Some(file) = pick_download_url(item) {
+                            let mut headers = serde_json::Map::new();
+                            headers.insert("Referer".to_string(), json!(REFERER));
+                            return Ok(TrackDownloadInfo {
+                                download_type: DownloadSource::Url,
+                                file_url: Some(file),
+                                file_url_headers: headers,
+                                temp_file_path: None,
+                                different_codec: Some(CodecFlags::MP3),
+                            });
+                        }
+                    }
+                }
+            }
+        }
         Err(Error::Other(format!(
-            "ccmixter: expected direct download URL, got {track_id}"
+            "ccmixter: could not resolve download for '{track_id}'"
         )))
     }
 

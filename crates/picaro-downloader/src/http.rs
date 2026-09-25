@@ -2,13 +2,18 @@
 
 use std::path::{Path, PathBuf};
 
-use picaro_utils::error::{Error, Result};
+use picaro_utils::error::Result;
 use picaro_utils::util::is_missing_executable_error;
 use reqwest::header::{HeaderMap, HeaderValue, RANGE};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use indicatif::{ProgressBar, ProgressStyle};
+
+/// Browser UA used when a request doesn't supply one. Some hosts (e.g. Yandex
+/// Disk's `downloader.disk.yandex.ru`) return 403 to non-browser clients.
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 /// Track a single in-flight download with an optional progress bar.
 pub struct DownloadProgress {
@@ -65,9 +70,15 @@ pub async fn download_to_path(
     // here used to silently defeat forced re-downloads and left a 0-byte
     // success signal. Python's `download_file` likewise only skips when the
     // track-level check says so.
+    let has_ua = headers
+        .as_ref()
+        .map_or(false, |h| h.contains_key(reqwest::header::USER_AGENT));
     let mut req = client.get(url);
     if let Some(h) = headers {
         req = req.headers(h);
+    }
+    if !has_ua {
+        req = req.header(reqwest::header::USER_AGENT, BROWSER_UA);
     }
     let mut resp = req.send().await?.error_for_status()?;
     let total = resp.content_length().unwrap_or(0);
