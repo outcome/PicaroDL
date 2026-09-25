@@ -373,15 +373,29 @@ impl Resolver {
                         };
                         match result {
                             Ok(p) => {
-                                self.record(&r.service, 0.5, true);
-                                save_scores(&self.scores_path, &self.scores);
-                                info!(
-                                    "resolver: '{}' -> {} [{}]",
-                                    query,
+                                if quality_ok(&p, r.tier) {
+                                    self.record(&r.service, 0.5, true);
+                                    save_scores(&self.scores_path, &self.scores);
+                                    info!(
+                                        "resolver: '{}' -> {} [{}]",
+                                        query,
+                                        r.service,
+                                        r.tier.as_str()
+                                    );
+                                    return Ok(p);
+                                }
+                                warn!(
+                                    "resolver: {} returned a file that doesn't match {} quality (wrong container / likely fake); retrying next source",
                                     r.service,
                                     r.tier.as_str()
                                 );
-                                return Ok(p);
+                                self.record(&r.service, 5.0, false);
+                                let _ = std::fs::remove_file(&p);
+                                chain.retain(|s| *s != r.service);
+                                last_err = Some(Error::Other(format!(
+                                    "quality mismatch from {}",
+                                    r.service
+                                )));
                             }
                             Err(e) => {
                                 warn!(
@@ -459,6 +473,39 @@ fn pick_track(files: &[PathBuf], query: &str) -> Option<PathBuf> {
             sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
         })
         .cloned()
+}
+
+/// Heuristic quality check: reject output that clearly doesn't match the tier
+/// (wrong container for lossless, or a lossless request that is really a
+/// low-bitrate transcode / "fake FLAC"). Returns true when acceptable.
+fn quality_ok(path: &Path, tier: QualityTier) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let lossless_ext = matches!(
+        ext.as_str(),
+        "flac" | "wav" | "aiff" | "aif" | "ape" | "wv" | "alac"
+    );
+    if tier == QualityTier::Lossless && !lossless_ext {
+        return false;
+    }
+    let Some(probe) = picaro_tagging::audio_probe(path) else {
+        return true;
+    };
+    if probe.duration_secs <= 5.0 {
+        return true;
+    }
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) as f64;
+    let kbps = size * 8.0 / probe.duration_secs / 1000.0;
+    // Only enforce a bitrate floor for lossless (to catch fake/transcoded
+    // FLACs); mp3/opus/m4a are accepted at any bitrate.
+    if tier == QualityTier::Lossless {
+        kbps >= 500.0
+    } else {
+        true
+    }
 }
 
 fn load_scores(path: &Path) -> HashMap<String, f64> {

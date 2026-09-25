@@ -34,6 +34,9 @@ Nothing waits on a slow source. Nothing asks you to log in.
 - **Safety checks.** Downloads are checked against their file signature before
   tagging, and anything extracted from an archive that isn't audio gets removed.
   Nothing is ever executed.
+- **Quality guard.** Downloads are probed for container and bitrate; a lossy
+  file masquerading as lossless (a "fake FLAC") is rejected and another source is
+  tried automatically.
 - **TUI and CLI.** A terminal browser for casual use, and a full CLI for scripts.
 - **Portable.** Pure Rust with `reqwest`, so it builds for desktop and
   cross-compiles to Android.

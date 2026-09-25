@@ -342,3 +342,24 @@ pub fn resize_cover_if_needed(image_path: &Path, max_bytes: u64) -> Result<std::
     drop(out);
     Ok(tmp_path)
 }
+
+/// Basic audio properties read back from a file, used for quality checks.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioProbe {
+    pub duration_secs: f64,
+    pub bit_rate: Option<u32>,
+    pub bit_depth: Option<u8>,
+    pub sample_rate: Option<u32>,
+}
+
+/// Read duration / bitrate / bit-depth / sample-rate from a file (best-effort).
+pub fn audio_probe(path: &Path) -> Option<AudioProbe> {
+    let reader = lofty::probe::Probe::open(path).ok()?.read().ok()?;
+    let p = reader.properties();
+    Some(AudioProbe {
+        duration_secs: p.duration().as_secs_f64(),
+        bit_rate: p.audio_bitrate().or(p.overall_bitrate()),
+        bit_depth: p.bit_depth(),
+        sample_rate: p.sample_rate(),
+    })
+}

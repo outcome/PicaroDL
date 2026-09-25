@@ -2,4 +2,4 @@
 
 pub mod tags;
 
-pub use tags::{resize_cover_if_needed, Tagger};
+pub use tags::{audio_probe, resize_cover_if_needed, AudioProbe, Tagger};

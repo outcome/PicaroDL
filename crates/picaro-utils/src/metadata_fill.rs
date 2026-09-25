@@ -128,11 +128,7 @@ fn upscale_artwork(url: &str) -> Option<String> {
 /// Uses `entity=album` so we get the canonical release artwork rather than a
 /// track thumbnail, scores every candidate against the wanted artist/album and
 /// returns the `artworkUrl100` upscaled to 3000x3000.
-async fn itunes_album_cover(
-    client: &reqwest::Client,
-    artist: &str,
-    title: &str,
-) -> Option<String> {
+async fn itunes_album_cover(client: &reqwest::Client, artist: &str, title: &str) -> Option<String> {
     let query = format!("{artist} {title}").trim().to_string();
     if query.is_empty() {
         return None;
@@ -158,7 +154,10 @@ async fn itunes_album_cover(
             .and_then(|x| x.as_str())
             .unwrap_or("");
         let a_name = it.get("artistName").and_then(|x| x.as_str()).unwrap_or("");
-        let art = it.get("artworkUrl100").and_then(|x| x.as_str()).unwrap_or("");
+        let art = it
+            .get("artworkUrl100")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
         if art.is_empty() {
             continue;
         }
