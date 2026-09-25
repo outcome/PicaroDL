@@ -198,7 +198,7 @@ live is on you — support the artists you like.
 ## Credits
 
 PicaroDL is a Rust rewrite of, and heavily inspired by,
-**[OrpheusDL](https://github.com/OrpheusDL/OrpheusDL)** by the OrpheusDL
+**[OrpheusDL](https://github.com/OrfiTeam/OrpheusDL)** by the OrpheusDL
 contributors. The module contract, download flow, tagging and formatting logic
 all follow OrpheusDL's design — the credit for that architecture belongs to that
 project. Thanks also to the maintainers of the crates this leans on: `reqwest`,
