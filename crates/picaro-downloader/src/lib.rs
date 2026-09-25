@@ -4,6 +4,7 @@ pub mod downloader;
 pub mod globals;
 pub mod hosters;
 pub mod http;
+pub mod mega;
 pub mod paths;
 pub mod resolver;
 

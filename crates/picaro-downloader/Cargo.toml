@@ -46,3 +46,5 @@ sevenz-rust.workspace = true
 zip.workspace = true
 log = "0.4"
 env_logger = "0.11"
+mega = "0.8"
+tokio-util = { version = "0.7", features = ["compat"] }

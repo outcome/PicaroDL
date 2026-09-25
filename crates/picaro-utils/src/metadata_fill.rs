@@ -1,4 +1,4 @@
-﻿//! Keyless metadata backfill for tracks with missing name/album/artist/cover.
+//! Keyless metadata backfill for tracks with missing name/album/artist/cover.
 //!
 //! All sources are public, need no API key and no sign-in:
 //!   1. Deezer      - api.deezer.com/search          (title/artist/album/cover_xl)
@@ -88,7 +88,6 @@ async fn deezer_lookup_best(
         "(demo",
         "demo)",
         "rehearsal",
-        "acoustic",
         "tribute",
         "made famous",
         "salute",

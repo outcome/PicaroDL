@@ -26,3 +26,6 @@ response*.txt
 .idea/
 .vscode/
 .DS_Store
+
+# non-working (search-only / broken) modules, parked for now
+crates/picaro-modules/src/_disabled/

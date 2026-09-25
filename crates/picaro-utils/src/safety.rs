@@ -84,3 +84,103 @@ pub fn purge_non_audio(dir: &Path) -> Vec<PathBuf> {
     }
     removed
 }
+
+// ---------------------------------------------------------------------------
+//  Malware / executable safety
+// ---------------------------------------------------------------------------
+
+use std::io::Read;
+
+/// Extensions that are executable or script-like: never expected in audio.
+pub const DANGEROUS_EXTENSIONS: &[&str] = &[
+    "exe", "dll", "scr", "com", "bat", "cmd", "msi", "msix", "js", "jse", "vbs", "vbe", "wsf",
+    "wsh", "ps1", "psm1", "psd1", "lnk", "url", "hta", "cpl", "reg", "jar", "sh", "bash", "zsh",
+    "app", "pif", "gadget", "inf", "sys", "drv", "msc", "apk", "dmg", "pkg", "deb", "rpm", "iso",
+    "img", "vhd", "vbs", "ws", "scf", "desktop",
+];
+
+pub fn is_dangerous_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| DANGEROUS_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Detect executable/script *content* by magic bytes (PE, ELF, Mach-O, shebang).
+pub fn looks_like_executable(path: &Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut b = [0u8; 4];
+    let n = f.read(&mut b).unwrap_or(0);
+    if n >= 2 && &b[..2] == b"MZ" {
+        return true; // Windows PE (exe/dll)
+    }
+    if n >= 4 && &b == b"\x7fELF" {
+        return true; // Linux ELF
+    }
+    if n >= 4
+        && matches!(
+            b,
+            [0xFE, 0xED, 0xFA, 0xCE]
+                | [0xFE, 0xED, 0xFA, 0xCF]
+                | [0xCE, 0xFA, 0xED, 0xFE]
+                | [0xCF, 0xFA, 0xED, 0xFE]
+        )
+    {
+        return true; // Mach-O
+    }
+    if n >= 2 && &b[..2] == b"#!" {
+        return true; // shebang script
+    }
+    false
+}
+
+pub fn is_dangerous(path: &Path) -> bool {
+    is_dangerous_extension(path) || looks_like_executable(path)
+}
+
+/// Recursively find dangerous files under `dir`.
+pub fn scan_dangerous(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if is_dangerous(&path) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// Optional ClamAV scan if `clamscan` is on PATH.
+/// Returns `Some(true)` = clean, `Some(false)` = infected, `None` = unavailable.
+pub fn clamav_scan(path: &Path) -> Option<bool> {
+    let out = std::process::Command::new("clamscan")
+        .arg("--no-summary")
+        .arg("--infected")
+        .arg(path)
+        .output()
+        .ok()?;
+    Some(out.status.success())
+}
+
+/// Reason a file is unsafe (executable/script content, or ClamAV detection).
+pub fn danger_reason(path: &Path) -> Option<String> {
+    if is_dangerous(path) {
+        return Some("executable/script content".into());
+    }
+    if let Some(clean) = clamav_scan(path) {
+        if !clean {
+            return Some("ClamAV: malware detected".into());
+        }
+    }
+    None
+}

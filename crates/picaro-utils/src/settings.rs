@@ -365,6 +365,12 @@ pub fn default_global_settings() -> Map<String, Value> {
         }),
     );
     m.insert(
+        "p2p".to_string(),
+        json!({
+            "enabled": false
+        }),
+    );
+    m.insert(
         "covers".to_string(),
         json!({
             "embed_cover": true,

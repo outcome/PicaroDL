@@ -384,40 +384,65 @@ impl Downloader {
                 let url = download.file_url.ok_or_else(|| {
                     Error::Download("module returned URL but no file_url".to_string())
                 })?;
-                let mut headers = reqwest::header::HeaderMap::new();
-                for (k, v) in download.file_url_headers.iter() {
-                    if let (Ok(name), Ok(value)) = (
-                        reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                        reqwest::header::HeaderValue::from_str(v.as_str().unwrap_or("")),
-                    ) {
-                        headers.insert(name, value);
+                // Keyless MEGA public links are fetched via the `mega` crate
+                // rather than the generic hoster resolver.
+                let mega_bytes = 'mega: {
+                    if !crate::mega::is_mega(&url) {
+                        break 'mega None;
                     }
-                }
-                let client = reqwest::Client::new();
-                // Band/blog modules often hand us a file-hoster landing page.
-                // Resolve it to a direct URL; fall back to the original.
-                let referer = headers
-                    .get(reqwest::header::REFERER)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let resolved = crate::hosters::resolve(&client, &url, &referer).await;
-                // A resolved direct link must not carry the module's foreign
-                // Referer (some hosts, e.g. Yandex Disk, 403 on it).
-                let headers = if resolved.is_some() {
-                    reqwest::header::HeaderMap::new()
-                } else {
-                    headers
+                    let dir = dest
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| self.output_path.clone());
+                    let files = crate::mega::download_mega(&url, &dir).await?;
+                    match crate::mega::pick_best_file(&files, &track_info.name) {
+                        Some(chosen) => {
+                            let chosen = chosen.to_path_buf();
+                            let len = tokio::fs::metadata(&chosen).await?.len();
+                            dest = chosen;
+                            Some(len)
+                        }
+                        None => None,
+                    }
                 };
-                let url = resolved.unwrap_or(url);
-                download_to_path(
-                    &client,
-                    &url,
-                    &dest,
-                    Some(headers),
-                    DownloadProgress::hidden(),
-                )
-                .await?
+                if let Some(bytes) = mega_bytes {
+                    bytes
+                } else {
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    for (k, v) in download.file_url_headers.iter() {
+                        if let (Ok(name), Ok(value)) = (
+                            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                            reqwest::header::HeaderValue::from_str(v.as_str().unwrap_or("")),
+                        ) {
+                            headers.insert(name, value);
+                        }
+                    }
+                    let client = reqwest::Client::new();
+                    // Band/blog modules often hand us a file-hoster landing page.
+                    // Resolve it to a direct URL; fall back to the original.
+                    let referer = headers
+                        .get(reqwest::header::REFERER)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let resolved = crate::hosters::resolve(&client, &url, &referer).await;
+                    // A resolved direct link must not carry the module's foreign
+                    // Referer (some hosts, e.g. Yandex Disk, 403 on it).
+                    let headers = if resolved.is_some() {
+                        reqwest::header::HeaderMap::new()
+                    } else {
+                        headers
+                    };
+                    let url = resolved.unwrap_or(url);
+                    download_to_path(
+                        &client,
+                        &url,
+                        &dest,
+                        Some(headers),
+                        DownloadProgress::hidden(),
+                    )
+                    .await?
+                }
             }
             DownloadSource::TempFilePath | DownloadSource::Mpd => {
                 // Non-URL modules stage the bytes themselves and hand us a
@@ -448,9 +473,21 @@ impl Downloader {
                 dest.display()
             )));
         }
+        if let Some(reason) = picaro_utils::safety::danger_reason(&dest) {
+            let _ = std::fs::remove_file(&dest);
+            return Err(Error::Download(format!(
+                "rejected unsafe download ({reason}): {}",
+                dest.display()
+            )));
+        }
 
-        // 7. Tag the file.
-        let container = container_for_extension(extension);
+        // 7. Tag the file. Use the on-disk extension when present (a MEGA
+        // node may carry a different container than the negotiated codec).
+        let container = dest
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(container_for_extension)
+            .unwrap_or_else(|| container_for_extension(extension));
         let meta_sep = globals.get_str_or("formatting", "metadata_separator", ";");
         let split_meta = globals.get_bool_or("formatting", "split_metadata", true);
         let mut tagger = Tagger::new(&track_info, container)
@@ -773,39 +810,64 @@ impl Downloader {
                 let url = download.file_url.ok_or_else(|| {
                     Error::Download("module returned URL but no file_url".to_string())
                 })?;
-                let mut headers = reqwest::header::HeaderMap::new();
-                for (k, v) in download.file_url_headers.iter() {
-                    if let (Ok(name), Ok(value)) = (
-                        reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                        reqwest::header::HeaderValue::from_str(v.as_str().unwrap_or("")),
-                    ) {
-                        headers.insert(name, value);
+                // Keyless MEGA public links are fetched via the `mega` crate
+                // rather than the generic hoster resolver.
+                let mega_bytes = 'mega: {
+                    if !crate::mega::is_mega(&url) {
+                        break 'mega None;
                     }
-                }
-                let client = reqwest::Client::new();
-                // See `download_track`: resolve hoster landing pages first.
-                let referer = headers
-                    .get(reqwest::header::REFERER)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let resolved = crate::hosters::resolve(&client, &url, &referer).await;
-                // A resolved direct link must not carry the module's foreign
-                // Referer (some hosts, e.g. Yandex Disk, 403 on it).
-                let headers = if resolved.is_some() {
-                    reqwest::header::HeaderMap::new()
-                } else {
-                    headers
+                    let dir = dest
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| self.output_path.clone());
+                    let files = crate::mega::download_mega(&url, &dir).await?;
+                    match crate::mega::pick_best_file(&files, &track_info.name) {
+                        Some(chosen) => {
+                            let chosen = chosen.to_path_buf();
+                            let len = tokio::fs::metadata(&chosen).await?.len();
+                            dest = chosen;
+                            Some(len)
+                        }
+                        None => None,
+                    }
                 };
-                let url = resolved.unwrap_or(url);
-                download_to_path(
-                    &client,
-                    &url,
-                    &dest,
-                    Some(headers),
-                    DownloadProgress::hidden(),
-                )
-                .await?
+                if let Some(bytes) = mega_bytes {
+                    bytes
+                } else {
+                    let mut headers = reqwest::header::HeaderMap::new();
+                    for (k, v) in download.file_url_headers.iter() {
+                        if let (Ok(name), Ok(value)) = (
+                            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                            reqwest::header::HeaderValue::from_str(v.as_str().unwrap_or("")),
+                        ) {
+                            headers.insert(name, value);
+                        }
+                    }
+                    let client = reqwest::Client::new();
+                    // See `download_track`: resolve hoster landing pages first.
+                    let referer = headers
+                        .get(reqwest::header::REFERER)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let resolved = crate::hosters::resolve(&client, &url, &referer).await;
+                    // A resolved direct link must not carry the module's foreign
+                    // Referer (some hosts, e.g. Yandex Disk, 403 on it).
+                    let headers = if resolved.is_some() {
+                        reqwest::header::HeaderMap::new()
+                    } else {
+                        headers
+                    };
+                    let url = resolved.unwrap_or(url);
+                    download_to_path(
+                        &client,
+                        &url,
+                        &dest,
+                        Some(headers),
+                        DownloadProgress::hidden(),
+                    )
+                    .await?
+                }
             }
             DownloadSource::TempFilePath | DownloadSource::Mpd => {
                 // See `download_track`: every non-URL result is a staged temp
@@ -891,8 +953,19 @@ impl Downloader {
                 dest.display()
             )));
         }
+        if let Some(reason) = picaro_utils::safety::danger_reason(&dest) {
+            let _ = std::fs::remove_file(&dest);
+            return Err(Error::Download(format!(
+                "rejected unsafe download ({reason}): {}",
+                dest.display()
+            )));
+        }
 
-        let container = container_for_extension(extension);
+        let container = dest
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(container_for_extension)
+            .unwrap_or_else(|| container_for_extension(extension));
         let meta_sep = globals.get_str_or("formatting", "metadata_separator", ";");
         let split_meta = globals.get_bool_or("formatting", "split_metadata", true);
         let mut tagger = Tagger::new(&track_info, container)
