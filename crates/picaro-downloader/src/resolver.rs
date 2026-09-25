@@ -146,6 +146,7 @@ impl Resolver {
                 "primitiveofferings",
                 "deadpulpit",
                 "youtube",
+                "deezerpreview",
             ],
             QualityTier::Medium => vec![
                 "zvu4it",
@@ -416,6 +417,7 @@ fn is_direct_track(service: &str) -> bool {
             | "grimearchive"
             | "globaldjmix"
             | "freemp3cloud"
+            | "deezerpreview"
     )
 }
 

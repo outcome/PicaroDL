@@ -11,6 +11,7 @@ pub mod classicalmusicdownload;
 pub mod coreradio;
 pub mod dance_music;
 pub mod deadpulpit;
+pub mod deezer_preview;
 pub mod dieordiy2;
 pub mod discogc;
 pub mod discografias;

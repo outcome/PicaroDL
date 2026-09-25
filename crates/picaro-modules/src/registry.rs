@@ -330,6 +330,7 @@ pub fn register_all(registry: &ModuleRegistry) -> Result<()> {
     crate::coreradio::register_module(registry);
     crate::dance_music::register_module(registry);
     crate::deadpulpit::register_module(registry);
+    crate::deezer_preview::register_module(registry);
     crate::dieordiy2::register_module(registry);
     crate::discogc::register_module(registry);
     crate::discografias::register_module(registry);
