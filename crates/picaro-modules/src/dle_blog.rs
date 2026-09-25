@@ -206,6 +206,17 @@ fn parse_direct_link(html: &str) -> Option<String> {
             return Some(m.as_str().to_string());
         }
     }
+    // Open (captcha-free) file hosts resolved by picaro-downloader::hosters.
+    // Preferred over filecrypt below, which is captcha gated.
+    let open_hosts = Regex::new(
+        r#"(?i)href="(https?://[^"]*(?:mediafire\.com|disk\.yandex|yadi\.sk|1fichier\.com|pixeldrain\.com|drive\.google\.com|dropbox\.com|gofile\.io|catbox\.moe|litterbox\.catbox\.moe|transfer\.sh|file\.io|tmpfiles\.org)[^"]*)""#,
+    )
+    .ok()?;
+    if let Some(c) = open_hosts.captures(html) {
+        if let Some(m) = c.get(1) {
+            return Some(m.as_str().to_string());
+        }
+    }
     let filecrypt = Regex::new(r#"href="(https?://filecrypt[^"]+)""#).ok()?;
     if let Some(c) = filecrypt.captures(html) {
         if let Some(m) = c.get(1) {

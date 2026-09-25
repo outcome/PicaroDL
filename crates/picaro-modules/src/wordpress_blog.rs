@@ -231,14 +231,27 @@ fn parse_album_meta(
 fn parse_download_link(html: &str, cfg: &WpBlogConfig) -> Option<String> {
     let href_re = Regex::new(r#"(?is)href="([^"]+)""#).unwrap();
     let host_prefix = format!("https://{}/download", cfg.host);
-    let file_hosts = [
-        "zippy",
+    // Open (captcha-free) hosts resolved by picaro-downloader::hosters.
+    let open_hosts = [
         "mediafire",
         "1fichier",
-        "mega",
-        "katfile",
-        "rapidgator",
+        "pixeldrain",
+        "disk.yandex",
+        "yadi.sk",
+        "drive.google",
+        "dropbox",
+        "gofile",
+        "catbox",
+        "litterbox",
+        "transfer.sh",
+        "file.io",
+        "tmpfiles",
     ];
+    // Recognised but captcha / unsupported hosts: kept only as a fallback so a
+    // post that offers both an open and a gated host still resolves to the open
+    // one.
+    let gated_hosts = ["zippy", "mega", "katfile", "rapidgator"];
+    let mut gated_hit: Option<String> = None;
     for cap in href_re.captures_iter(html) {
         let url = match cap.get(1) {
             Some(m) => m.as_str().trim(),
@@ -247,18 +260,16 @@ fn parse_download_link(html: &str, cfg: &WpBlogConfig) -> Option<String> {
         if url.is_empty() {
             continue;
         }
-        if url.contains("filecrypt") {
-            return Some(url.to_string());
-        }
         let lower = url.to_lowercase();
-        if file_hosts.iter().any(|h| lower.contains(h)) {
+        if open_hosts.iter().any(|h| lower.contains(h)) {
             return Some(url.to_string());
         }
-        if url.starts_with(&host_prefix) {
-            return Some(url.to_string());
+        let gated = url.contains("filecrypt") || gated_hosts.iter().any(|h| lower.contains(h));
+        if (gated || url.starts_with(&host_prefix)) && gated_hit.is_none() {
+            gated_hit = Some(url.to_string());
         }
     }
-    None
+    gated_hit
 }
 
 async fn fetch_album_page(

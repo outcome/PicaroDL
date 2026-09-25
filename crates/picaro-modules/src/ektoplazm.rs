@@ -78,6 +78,8 @@ fn decode_entities(s: &str) -> String {
         .replace("&#039;", "'")
         .replace("&#8217;", "'")
         .replace("&#8211;", "-")
+        .replace("&#8212;", "-")
+        .replace("&#x2d;", "-")
         .replace("&nbsp;", " ")
         .trim()
         .to_string()
@@ -169,9 +171,15 @@ fn parse_album_meta(html: &str) -> (String, String, Option<String>) {
             .captures(html)
             .and_then(|c| c.get(1).map(|m| m.as_str()))
             .unwrap_or("Unknown");
-        let raw = raw.split(" - Ektoplazm").next().unwrap_or(raw);
-        decode_entities(raw)
+        decode_entities(raw.split(" - Ektoplazm").next().unwrap_or(raw))
     };
+    // og:title is "Artist – Release | Ektoplazm"; strip the site suffix.
+    let title = title
+        .split(" | Ektoplazm")
+        .next()
+        .unwrap_or(&title)
+        .trim()
+        .to_string();
     let (artist, album) = match title.find(" - ") {
         Some(i) => (
             title[..i].trim().to_string(),
@@ -202,6 +210,32 @@ fn parse_file_links(html: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Pick a single archive to download. Ektoplazm lists the same release as
+/// `…-MP3.zip`, `…-FLAC.zip` and `…-WAV.rar`; downloading all three is wasteful
+/// (and the WAV rar is huge). Prefer the small MP3 zip, then any zip, then rar.
+fn pick_archive(links: &[String]) -> Vec<String> {
+    let rank = |u: &str| -> u8 {
+        let l = u.to_lowercase();
+        if l.ends_with("mp3.zip") {
+            0
+        } else if l.ends_with(".zip") {
+            1
+        } else if l.ends_with(".rar") {
+            2
+        } else if l.ends_with(".7z") {
+            3
+        } else {
+            4
+        }
+    };
+    links
+        .iter()
+        .min_by_key(|u| rank(u))
+        .cloned()
+        .map(|u| vec![u])
+        .unwrap_or_default()
 }
 
 fn album_meta(data: &HashMap<String, Value>) -> (String, String, String) {
@@ -319,12 +353,20 @@ impl picaro_utils::module::ModuleInterface for EktoplazmModule {
         };
         let html = fetch_page(&self.client, &url).await?;
         let (artist, album, cover) = parse_album_meta(&html);
-        let links = parse_file_links(&html);
+        let links = pick_archive(&parse_file_links(&html));
         if links.is_empty() {
             return Err(Error::Other(format!(
                 "ektoplazm: no file downloads found at {url}"
             )));
         }
+        let quality = if links[0].to_lowercase().contains("flac")
+            || links[0].to_lowercase().ends_with(".rar")
+            || links[0].to_lowercase().ends_with(".7z")
+        {
+            "FLAC"
+        } else {
+            "MP3"
+        };
         Ok(AlbumInfo {
             name: album,
             artist,
@@ -332,7 +374,7 @@ impl picaro_utils::module::ModuleInterface for EktoplazmModule {
             release_year: 0,
             artist_id: None,
             id: Some(album_id.to_string()),
-            quality: Some("FLAC".to_string()),
+            quality: Some(quality.to_string()),
             cover_url: cover,
             cover_type: Some(ImageFileType::Jpg),
             ..Default::default()

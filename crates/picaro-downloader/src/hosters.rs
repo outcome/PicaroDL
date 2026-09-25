@@ -44,6 +44,15 @@ pub fn is_hoster(url: &str) -> bool {
                 | "yadi.sk"
                 | "imagenetz.de"
                 | "send.now"
+                | "pixeldrain.com"
+                | "drive.google.com"
+                | "dropbox.com"
+                | "gofile.io"
+                | "catbox.moe"
+                | "litterbox.catbox.moe"
+                | "transfer.sh"
+                | "file.io"
+                | "tmpfiles.org"
         )
     )
 }
@@ -59,6 +68,14 @@ pub async fn resolve(client: &reqwest::Client, url: &str, referer: &str) -> Opti
         "mediafire.com" => resolve_mediafire(client, url, referer).await,
         "1fichier.com" => resolve_1fichier(client, url, referer).await,
         "disk.yandex.ru" | "disk.yandex.com" | "yadi.sk" => resolve_yandex(client, url).await,
+        "pixeldrain.com" => resolve_pixeldrain(url),
+        "drive.google.com" => resolve_gdrive(url),
+        "dropbox.com" => resolve_dropbox(url),
+        "gofile.io" => resolve_gofile(client, url).await,
+        // These already hand out direct file URLs.
+        "catbox.moe" | "litterbox.catbox.moe" | "transfer.sh" | "file.io" | "tmpfiles.org" => {
+            Some(url.to_string())
+        }
         // Recognised but captcha / JS gated: do not attempt to bypass.
         "hotlink.cc" | "nfile.cc" | "uploadbox.com" | "turbobit.net" | "nitroflare.com"
         | "imagenetz.de" | "send.now" => {
@@ -136,6 +153,71 @@ async fn resolve_mediafire(client: &reqwest::Client, url: &str, referer: &str) -
     }
     warn!("mediafire: no direct link found (dead/private file?); keeping original URL");
     None
+}
+
+/// pixeldrain: `https://pixeldrain.com/u/<id>` -> `.../api/file/<id>`.
+fn resolve_pixeldrain(url: &str) -> Option<String> {
+    let id = url.split("/u/").nth(1)?.split(['?', '/']).next()?;
+    if id.is_empty() {
+        return None;
+    }
+    info!("pixeldrain: resolved direct link");
+    Some(format!("https://pixeldrain.com/api/file/{id}"))
+}
+
+/// Google Drive: `.../file/d/<id>/view` -> `.../uc?export=download&id=<id>`.
+fn resolve_gdrive(url: &str) -> Option<String> {
+    let id = url.split("/d/").nth(1)?.split(['?', '/']).next()?;
+    if id.is_empty() {
+        return None;
+    }
+    info!("google drive: resolved direct link");
+    Some(format!(
+        "https://drive.google.com/uc?export=download&id={id}"
+    ))
+}
+
+/// Dropbox: force `?dl=1`.
+fn resolve_dropbox(url: &str) -> Option<String> {
+    let base = url.split('?').next().unwrap_or(url);
+    info!("dropbox: resolved direct link");
+    Some(format!("{base}?dl=1"))
+}
+
+/// gofile.io: `https://gofile.io/d/<id>` -> direct link via the public API.
+async fn resolve_gofile(client: &reqwest::Client, url: &str) -> Option<String> {
+    let id = url.split("/d/").nth(1)?.split(['?', '/']).next()?;
+    if id.is_empty() {
+        return None;
+    }
+    fn find_link(v: &serde_json::Value) -> Option<String> {
+        if let Some(s) = v.get("link").and_then(|x| x.as_str()) {
+            return Some(s.to_string());
+        }
+        if let Some(o) = v.get("contents").and_then(|x| x.as_object()) {
+            for c in o.values() {
+                if let Some(l) = find_link(c) {
+                    return Some(l);
+                }
+            }
+        }
+        None
+    }
+    let api = format!("https://api.gofile.io/getContent?contentId={id}&wt=4fd6sg89d7s6");
+    let v: serde_json::Value = client
+        .get(&api)
+        .header(reqwest::header::USER_AGENT, BROWSER_UA)
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    let link = find_link(&v);
+    if link.is_some() {
+        info!("gofile: resolved direct link");
+    }
+    link
 }
 
 /// Yandex Disk public share (`disk.yandex.ru/d/<key>`). The public REST API is

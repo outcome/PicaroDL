@@ -1,13 +1,17 @@
 //! Dance Music Organisation (dance-music.org) site module.
 //!
 //! The site is backed by Perl CGI scripts under `/cgi-bin/`:
-//!   - `/cgi-bin/free-mp3-music-downloads.pl?artist=<id>&track=<id>` lists a
-//!     track and exposes **direct** links of the form
-//!     `/cgi-bin/download_music.pl?MP3=1&ID=<id>&UID=<token>` (audio/mpeg).
-//!   - The homepage / chart is itself served by the same `.pl` script.
+//!   - `/cgi-bin/free-mp3-music-downloads.pl?genre=<Genre>` lists albums and
+//!     their tracks. Each track is an `<a class="play" …>` with `data-title`,
+//!     `data-artist`, `data-album` and an `href`/`data-href` pointing at
+//!     `/cgi-bin/download_music.pl?MP3=1&ID=<id>&UID=<token>`.
+//!   - That download endpoint returns a `302` to a **static** MP3 under
+//!     `/mp3/…` when the `DMO_DOWNLOAD=1` cookie is present (the cookie is what
+//!     the site's JS normally sets). The static URL needs no auth, so we
+//!     resolve the redirect and hand the direct link to the downloader.
 //!
-//! There is no native full-text search, so `search()` scans the chart listing
-//! and filters by substring on the track title.
+//! There is no native full-text search, so `search()` scans every genre
+//! listing concurrently and filters by token overlap with the query.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,7 +21,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{json, Value};
 
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use picaro_utils::error::{Error, Result};
 use picaro_utils::models::*;
 use picaro_utils::module::CodecOptions;
@@ -75,6 +79,7 @@ fn decode_entities(s: &str) -> String {
     s.replace("&amp;", "&")
         .replace("&quot;", "\"")
         .replace("&#039;", "'")
+        .replace("&#39;", "'")
         .replace("&nbsp;", " ")
         .trim()
         .to_string()
@@ -105,24 +110,38 @@ async fn fetch_page(client: &reqwest::Client, url: &str) -> Result<String> {
         .map_err(|e| Error::Other(format!("dance-music read: {e}")))
 }
 
-fn parse_track_links(html: &str) -> Vec<(String, String)> {
+/// A parsed track row from a genre listing page.
+struct TrackRow {
+    artist: String,
+    title: String,
+    album: String,
+    download_url: String,
+}
+
+fn parse_track_rows(html: &str) -> Vec<TrackRow> {
     let re = Regex::new(
-        r#"(?is)<a[^>]*href="(/cgi-bin/free-mp3-music-downloads\.pl\?[^"]*artist=[^"]*track=[^"]*)"[^>]*>(.*?)</a>"#,
+        r#"(?is)<a[^>]*data-title="([^"]*)"[^>]*data-artist="([^"]*)"[^>]*data-album="([^"]*)"[^>]*(?:data-)?href="(/cgi-bin/download_music\.pl\?[^"]+)""#,
     )
     .unwrap();
-    let tag = Regex::new(r"<[^>]*>").unwrap();
-    let mut out: Vec<(String, String)> = Vec::new();
+    let mut out = Vec::new();
     for cap in re.captures_iter(html) {
-        let url = absolute(cap.get(1).map(|m| m.as_str()).unwrap_or(""));
-        let raw = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-        let name = decode_entities(&tag.replace_all(raw, " "));
-        if url.is_empty() || name.is_empty() {
+        let title = decode_entities(cap.get(1).map(|m| m.as_str()).unwrap_or(""));
+        let artist = decode_entities(cap.get(2).map(|m| m.as_str()).unwrap_or(""));
+        let album = decode_entities(cap.get(3).map(|m| m.as_str()).unwrap_or(""));
+        let dl = decode_entities(cap.get(4).map(|m| m.as_str()).unwrap_or(""));
+        if dl.is_empty() {
             continue;
         }
-        if out.iter().any(|(u, _)| *u == url) {
+        let url = absolute(&dl);
+        if out.iter().any(|r: &TrackRow| r.download_url == url) {
             continue;
         }
-        out.push((url, name));
+        out.push(TrackRow {
+            artist,
+            title,
+            album,
+            download_url: url,
+        });
     }
     out
 }
@@ -131,12 +150,83 @@ fn parse_download_links(html: &str) -> Vec<String> {
     let re = Regex::new(r#"(?is)href="(/cgi-bin/download_music\.pl\?[^"]+)""#).unwrap();
     let mut out = Vec::new();
     for cap in re.captures_iter(html) {
-        let url = absolute(cap.get(1).map(|m| m.as_str()).unwrap_or(""));
+        let url = absolute(&decode_entities(
+            cap.get(1).map(|m| m.as_str()).unwrap_or(""),
+        ));
         if !url.is_empty() && !out.contains(&url) {
             out.push(url);
         }
     }
     out
+}
+
+fn track_label(r: &TrackRow) -> String {
+    if !r.artist.is_empty() && !r.title.is_empty() {
+        format!("{} - {}", r.artist, r.title)
+    } else if !r.title.is_empty() {
+        r.title.clone()
+    } else {
+        r.album.clone()
+    }
+}
+
+/// `search()` appends `&dn=<label>` to the download URL so the album path
+/// (which cannot see the original search result) can recover artist/title.
+/// The server ignores unknown query parameters.
+fn parse_dn(url: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    for pair in query.split('&') {
+        if let Some(v) = pair.strip_prefix("dn=") {
+            let decoded = percent_decode_str(v).decode_utf8_lossy().to_string();
+            if !decoded.is_empty() {
+                return Some(decoded);
+            }
+        }
+    }
+    None
+}
+
+fn split_label(label: &str) -> (String, String) {
+    match label.find(" - ") {
+        Some(i) => (
+            label[..i].trim().to_string(),
+            label[i + 3..].trim().to_string(),
+        ),
+        None => (String::new(), label.trim().to_string()),
+    }
+}
+
+/// Resolve a `download_music.pl` URL to the static `/mp3/…` file it redirects
+/// to. Requires the `DMO_DOWNLOAD=1` cookie; no session state is needed.
+async fn resolve_direct(track_id: &str) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .user_agent(UA)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| Error::Other(format!("dance-music client: {e}")))?;
+    let resp = client
+        .get(track_id)
+        .header("Referer", REFERER)
+        .header("Cookie", "DMO_DOWNLOAD=1")
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("dance-music download: {e}")))?;
+    if let Some(loc) = resp.headers().get(reqwest::header::LOCATION) {
+        if let Ok(loc) = loc.to_str() {
+            let direct = decode_entities(loc);
+            if direct.starts_with("http") {
+                return Ok(direct);
+            }
+        }
+    }
+    // Some links already point straight at the static file.
+    if resp.status().is_success() && track_id.contains("/mp3/") {
+        return Ok(track_id.to_string());
+    }
+    Err(Error::Other(format!(
+        "dance-music: could not resolve direct file for {track_id} (HTTP {})",
+        resp.status()
+    )))
 }
 
 #[async_trait]
@@ -161,17 +251,39 @@ impl picaro_utils::module::ModuleInterface for DanceMusicModule {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| {
-                let q = track_id.split('?').nth(1).unwrap_or("");
-                let re = Regex::new(r"ID=(\d+)").unwrap();
-                re.captures(q)
-                    .and_then(|c| c.get(1).map(|m| format!("Track {}", m.as_str())))
-                    .unwrap_or_else(|| track_id.to_string())
+                parse_dn(track_id)
+                    .map(|l| split_label(&l).1)
+                    .unwrap_or_else(|| {
+                        let re = Regex::new(r"ID=(\d+)").unwrap();
+                        re.captures(track_id)
+                            .and_then(|c| c.get(1).map(|m| format!("Track {}", m.as_str())))
+                            .unwrap_or_else(|| track_id.to_string())
+                    })
+            });
+        let artist = data
+            .get("__artist__")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let a = parse_dn(track_id)
+                    .map(|l| split_label(&l).0)
+                    .unwrap_or_default();
+                if a.is_empty() {
+                    None
+                } else {
+                    Some(a)
+                }
             });
         Ok(TrackInfo {
             name,
-            album: String::new(),
+            album: data
+                .get("__album__")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             album_id: String::new(),
-            artists: vec![],
+            artists: artist.map(|a| vec![a]).unwrap_or_default(),
             codec: CodecFlags::MP3,
             cover_url: String::new(),
             release_year: 0,
@@ -201,11 +313,16 @@ impl picaro_utils::module::ModuleInterface for DanceMusicModule {
                 "dance-music: expected direct MP3 URL, got {track_id}"
             )));
         }
+        let direct = if track_id.contains("/mp3/") {
+            track_id.to_string()
+        } else {
+            resolve_direct(track_id).await?
+        };
         let mut headers = serde_json::Map::new();
         headers.insert("Referer".to_string(), json!(REFERER));
         Ok(TrackDownloadInfo {
             download_type: DownloadSource::Url,
-            file_url: Some(track_id.to_string()),
+            file_url: Some(direct),
             file_url_headers: headers,
             temp_file_path: None,
             different_codec: Some(CodecFlags::MP3),
@@ -217,6 +334,42 @@ impl picaro_utils::module::ModuleInterface for DanceMusicModule {
         album_id: &str,
         _data: HashMap<String, Value>,
     ) -> Result<AlbumInfo> {
+        // A track download URL is treated as a single-track "album" so the
+        // album-based resolver path can still fetch it.
+        if album_id.starts_with("http")
+            && (album_id.contains("download_music.pl") || album_id.contains("/mp3/"))
+        {
+            let (artist, name) = match parse_dn(album_id) {
+                Some(label) => {
+                    let (a, n) = split_label(&label);
+                    (a, n)
+                }
+                None => {
+                    let re = Regex::new(r"ID=(\d+)").unwrap();
+                    let n = re
+                        .captures(album_id)
+                        .and_then(|c| c.get(1).map(|m| format!("Track {}", m.as_str())))
+                        .unwrap_or_else(|| album_id.to_string());
+                    (String::new(), n)
+                }
+            };
+            return Ok(AlbumInfo {
+                name,
+                // Must be non-empty: the album folder template is
+                // `{artist}/{name}`, and an empty artist yields a leading `/`
+                // that `Path::join` would resolve against the drive root.
+                artist: if artist.is_empty() {
+                    "Dance Music Organisation".to_string()
+                } else {
+                    artist
+                },
+                tracks: vec![TrackRef::Id(album_id.to_string())],
+                release_year: 0,
+                id: Some(album_id.to_string()),
+                quality: Some("MP3".to_string()),
+                ..Default::default()
+            });
+        }
         let url = absolute(album_id);
         let html = fetch_page(&self.client, &url).await?;
         let downloads = parse_download_links(&html);
@@ -233,7 +386,7 @@ impl picaro_utils::module::ModuleInterface for DanceMusicModule {
             .unwrap_or_else(|| album_id.to_string());
         Ok(AlbumInfo {
             name: title,
-            artist: String::new(),
+            artist: "Dance Music Organisation".to_string(),
             tracks: downloads.into_iter().map(TrackRef::Id).collect(),
             release_year: 0,
             id: Some(album_id.to_string()),
@@ -292,31 +445,52 @@ impl picaro_utils::module::ModuleInterface for DanceMusicModule {
         _track_info: Option<&TrackInfo>,
         limit: u32,
     ) -> Result<Vec<SearchResult>> {
-        let _ = utf8_percent_encode(query, NON_ALPHANUMERIC);
-        let url = format!("{BASE}/cgi-bin/free-mp3-music-downloads.pl");
-        let resp = self
-            .client
-            .get(&url)
-            .header("Referer", REFERER)
-            .send()
-            .await
-            .map_err(|e| Error::Other(format!("dance-music search: {e}")))?;
-        if !resp.status().is_success() {
-            return Ok(Vec::new());
-        }
-        let html = resp
-            .text()
-            .await
-            .map_err(|e| Error::Other(format!("dance-music search read: {e}")))?;
-        let needle = query.trim().to_lowercase();
-        let mut out: Vec<SearchResult> = Vec::new();
-        for (url, name) in parse_track_links(&html) {
-            if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
+        // The site's CGI exposes a hidden full-text filter: `?search=<term>`
+        // returns a listing with matching tracks (empty for no match). It
+        // matches substrings, so a combined "artist title" query can miss;
+        // search the title half when the query is in "artist - title" form.
+        let term = match query.split_once(" - ") {
+            Some((_artist, title)) if !title.trim().is_empty() => title.trim().to_string(),
+            _ => query.trim().to_string(),
+        };
+        let encoded = utf8_percent_encode(&term, NON_ALPHANUMERIC).to_string();
+        let url = format!("{BASE}/cgi-bin/free-mp3-music-downloads.pl?search={encoded}");
+        let html = fetch_page(&self.client, &url).await?;
+
+        let tokens: Vec<String> = query
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| t.len() >= 2)
+            .map(|t| t.to_string())
+            .collect();
+
+        let mut scored: Vec<(usize, TrackRow)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for row in parse_track_rows(&html) {
+            if !seen.insert(row.download_url.clone()) {
                 continue;
             }
+            let hay = format!("{} {} {}", row.artist, row.title, row.album).to_lowercase();
+            let score = tokens.iter().filter(|t| hay.contains(t.as_str())).count();
+            if tokens.is_empty() || score > 0 {
+                scored.push((score, row));
+            }
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut out: Vec<SearchResult> = Vec::new();
+        for (_, row) in scored {
+            let label = track_label(&row);
+            let artists = if row.artist.is_empty() {
+                None
+            } else {
+                Some(vec![row.artist.clone()])
+            };
+            let dn = utf8_percent_encode(&label, NON_ALPHANUMERIC).to_string();
             out.push(SearchResult {
-                result_id: url,
-                name: Some(name),
+                result_id: format!("{}&dn={dn}", row.download_url),
+                name: Some(label),
+                artists,
                 ..Default::default()
             });
             if out.len() >= limit as usize {

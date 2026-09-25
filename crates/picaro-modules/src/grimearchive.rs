@@ -182,11 +182,27 @@ impl picaro_utils::module::ModuleInterface for GrimeArchiveModule {
                 "grimearchive: expected download URL, got {track_id}"
             )));
         }
+        // The resolver treats this module as a "direct track" provider, so the
+        // id coming from `search()` is a `/mix/<id>` landing page, not the
+        // bytes. Fetch it and pull out the real `/download/<id>` link.
+        let direct = if track_id.contains("/download/") {
+            track_id.to_string()
+        } else {
+            let html = fetch_page(&self.client, track_id).await?;
+            let dl = Regex::new(r#"(?is)href="(/download/\d+)"#)
+                .unwrap()
+                .captures(&html)
+                .and_then(|c| c.get(1).map(|m| absolute(m.as_str())))
+                .ok_or_else(|| {
+                    Error::Other(format!("grimearchive: no download link at {track_id}"))
+                })?;
+            dl
+        };
         let mut headers = serde_json::Map::new();
-        headers.insert("Referer".to_string(), json!(REFERER));
+        headers.insert("Referer".to_string(), json!(track_id));
         Ok(TrackDownloadInfo {
             download_type: DownloadSource::Url,
-            file_url: Some(track_id.to_string()),
+            file_url: Some(direct),
             file_url_headers: headers,
             temp_file_path: None,
             different_codec: Some(CodecFlags::MP3),

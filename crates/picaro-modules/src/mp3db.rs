@@ -201,7 +201,7 @@ fn parse_album_meta(html: &str) -> (String, String, String, String, Option<i32>)
 
 fn parse_download_link(html: &str) -> Option<String> {
     let re = Regex::new(
-        r#"href="(https?://[^"]*(?:nfile\.cc|uploadbox\.com|zippyshare\.com|mediafire\.com|mega\.nz|mega\.co\.nz|1fichier\.com)[^"]*)""#,
+        r#"href="(https?://[^"]*(?:nfile\.cc|uploadbox\.com|zippyshare\.com|mediafire\.com|mega\.nz|mega\.co\.nz|1fichier\.com|pixeldrain\.com|disk\.yandex|yadi\.sk|drive\.google\.com|dropbox\.com|gofile\.io|catbox\.moe|litterbox\.catbox\.moe|transfer\.sh|file\.io|tmpfiles\.org)[^"]*)""#,
     )
     .unwrap();
     re.captures(html)

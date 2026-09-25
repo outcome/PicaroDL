@@ -108,7 +108,16 @@ fn suggestion_to_result(s: &Value) -> Option<SearchResult> {
     if link.is_empty() {
         return None;
     }
-    let url = percent_decode_str(link).decode_utf8_lossy().to_string();
+    // The JSON `link` is percent-encoded, but literal `+` is used for spaces in
+    // the path (`Nicole+Moudaber+-+In+The+MOOD+...mp3`). Decoding leaves the
+    // `+` untouched, and the CDN stores the real filenames with spaces, so a
+    // literal `+` path 404s. Re-encode spaces in the path as `%20` (query
+    // strings are left alone).
+    let decoded = percent_decode_str(link).decode_utf8_lossy().to_string();
+    let url = match decoded.split_once('?') {
+        Some((path, query)) => format!("{}?{}", path.replace('+', "%20"), query),
+        None => decoded.replace('+', "%20"),
+    };
     let name = s
         .get("value")
         .and_then(|x| x.as_str())

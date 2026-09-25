@@ -109,6 +109,9 @@ enum Command {
     /// Query every lyrics provider for "artist - title".
     Lyrics { query: String },
 
+    /// Look up cover art for "artist - title" and print the chosen source/URL.
+    Cover { query: String },
+
     /// Benchmark sources against a fixed query set (timing + result counts).
     Benchmark {
         /// Benchmark a single service (default: all download-capable modules).
@@ -243,6 +246,23 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     .map(|d| format!(" [{:02}:{:02}]", d / 60, d % 60))
                     .unwrap_or_default();
                 println!("{:<8}  {:<48}  {}{}", r.result_id, title, artists, dur);
+            }
+        }
+        Command::Cover { query } => {
+            let (artist, title) = match query.find(" - ") {
+                Some(i) => (
+                    query[..i].trim().to_string(),
+                    query[i + 3..].trim().to_string(),
+                ),
+                None => (String::new(), query.trim().to_string()),
+            };
+            let client = picaro_utils::http::build_raw_client();
+            match picaro_utils::metadata_fill::lookup_cover(&client, &artist, &title).await {
+                Some(h) => println!(
+                    "{} | album='{}' artist='{}' | {}",
+                    h.source, h.album, h.artist, h.url
+                ),
+                None => println!("NO COVER"),
             }
         }
         Command::Lyrics { query } => {

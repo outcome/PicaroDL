@@ -263,12 +263,33 @@ fn parse_cover(html: &str) -> Option<String> {
 }
 
 fn parse_file_host_link(html: &str) -> Option<String> {
-    let re = Regex::new(
-        r#"href="(https?://[^"]*(?:mediafire|mega|zippyshare|1fichier|drive\.google|dropbox|pixeldrain|gofile|archive\.org|yandex|imagenetz|send\.now|katfile|rapidgator|ddownload)[^"]*)""#,
+    let href_re = Regex::new(r#"(?is)href="([^"]+)""#).unwrap();
+    // Open (captcha-free) hosts resolved by picaro-downloader::hosters.
+    let open_re = Regex::new(
+        r#"(?i)(?:mediafire|1fichier|pixeldrain|disk\.yandex|yadi\.sk|drive\.google|dropbox|gofile|catbox|litterbox|transfer\.sh|file\.io|tmpfiles)"#,
     )
     .unwrap();
-    re.captures(html)
-        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+    // Recognised but captcha / unsupported hosts: kept only as a fallback so a
+    // post that offers both an open and a gated host still resolves to the open
+    // one.
+    let gated_re = Regex::new(
+        r#"(?i)(?:mega|zippyshare|archive\.org|yandex|imagenetz|send\.now|katfile|rapidgator|ddownload|filecrypt|turbobit|nitroflare|hotlink|nfile|uploadbox)"#,
+    )
+    .unwrap();
+    let mut gated_hit: Option<String> = None;
+    for cap in href_re.captures_iter(html) {
+        let url = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        if !url.starts_with("http") {
+            continue;
+        }
+        if open_re.is_match(url) {
+            return Some(url.to_string());
+        }
+        if gated_re.is_match(url) && gated_hit.is_none() {
+            gated_hit = Some(url.to_string());
+        }
+    }
+    gated_hit
 }
 
 fn album_meta(data: &HashMap<String, Value>) -> (String, String, String, Option<i32>) {

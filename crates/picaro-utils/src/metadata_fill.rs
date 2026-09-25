@@ -1,4 +1,4 @@
-//! Keyless metadata backfill for tracks with missing name/album/artist/cover.
+﻿//! Keyless metadata backfill for tracks with missing name/album/artist/cover.
 //!
 //! All sources are public, need no API key and no sign-in:
 //!   1. Deezer      - api.deezer.com/search          (title/artist/album/cover_xl)
@@ -63,33 +63,91 @@ async fn deezer_lookup(client: &reqwest::Client, query: &str) -> Option<Value> {
 
 /// Deezer search that scores every candidate against the wanted title and
 /// returns the best match, penalising live/remix/instrumental/karaoke variants.
-async fn deezer_lookup_best(client: &reqwest::Client, query: &str, want: &str) -> Option<Value> {
-    let url = format!("https://api.deezer.com/search?q={}&limit=10", enc(query));
+async fn deezer_lookup_best(
+    client: &reqwest::Client,
+    query: &str,
+    want: &str,
+    artist: &str,
+) -> Option<Value> {
+    let url = format!("https://api.deezer.com/search?q={}&limit=25", enc(query));
     let v = get_json(client, &url).await?;
     let arr = v.get("data")?.as_array()?;
     let bad = [
         "(live",
         "live at",
         "live from",
+        "live in",
+        "live)",
         "remix",
         "instrumental",
         "karaoke",
-        "cover",
+        "cover version",
+        "cover)",
         "(edit",
         "radio edit",
         "(demo",
         "demo)",
         "rehearsal",
         "acoustic",
-        "session",
+        "tribute",
+        "made famous",
+        "salute",
+        "sounds of",
+        "experience",
+        "vs.",
+        "vs ",
+        "lullaby",
+        "rockabye",
+        "8-bit",
+        "string quartet",
+        "piano tribute",
+        "in the style of",
+        "originally performed",
+        "long live",
+        "the new ",
+        "new beatles",
+        "played by",
+        "performed by",
+    ];
+    let compilation = [
+        "greatest hits",
+        "best of",
+        "compilation",
+        "anthology",
+        "collection",
+        " the hits",
+        "hits)",
+        "essential",
+        "box set",
+        "soundtrack",
     ];
     let mut best: Option<(f64, Value)> = None;
     for it in arr {
         let t = it.get("title").and_then(|x| x.as_str()).unwrap_or("");
+        let a = it
+            .pointer("/artist/name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        // Hard artist gate when we know the artist (rejects tribute bands).
+        if !artist.trim().is_empty() && textmatch::similarity(artist, a) < 0.5 {
+            continue;
+        }
         let mut s = textmatch::similarity(want, t);
+        if !artist.trim().is_empty() {
+            s += 0.6 * textmatch::similarity(artist, a);
+        }
         let lt = t.to_lowercase();
-        if bad.iter().any(|b| lt.contains(b)) {
-            s -= 0.35;
+        let la = a.to_lowercase();
+        if bad.iter().any(|b| lt.contains(b) || la.contains(b)) {
+            s -= 0.7;
+        }
+        let lal = it
+            .pointer("/album/title")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if compilation.iter().any(|b| lal.contains(b)) {
+            s -= 0.4;
         }
         if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
             best = Some((s, it.clone()));
@@ -285,7 +343,7 @@ pub async fn fill_track_metadata(
 
     // 1. Deezer (single call covers name/artist/album + high-res cover).
     if need_name || need_album || need_artist || need_cover {
-        if let Some(hit) = deezer_lookup_best(client, &query, &title).await {
+        if let Some(hit) = deezer_lookup_best(client, &query, &title, &artist).await {
             if need_name {
                 if let Some(t) = hit.get("title").and_then(|v| v.as_str()) {
                     if !t.is_empty() {
@@ -465,7 +523,7 @@ pub async fn fill_track_metadata_force(
         if query.is_empty() {
             continue;
         }
-        let Some(hit) = deezer_lookup_best(client, &query, t).await else {
+        let Some(hit) = deezer_lookup_best(client, &query, t, &artist_q).await else {
             continue;
         };
         let h_title = hit.get("title").and_then(|v| v.as_str()).unwrap_or("");
@@ -528,4 +586,61 @@ pub async fn fill_track_metadata_force(
     filled.sort_unstable();
     filled.dedup();
     filled
+}
+
+/// Result of a cover lookup (for the CLI / diagnostics).
+#[derive(Debug, Clone)]
+pub struct CoverHit {
+    pub source: &'static str,
+    pub url: String,
+    pub album: String,
+    pub artist: String,
+}
+
+/// Look up cover art for `artist` / `title`, reporting which source won.
+pub async fn lookup_cover(client: &reqwest::Client, artist: &str, title: &str) -> Option<CoverHit> {
+    let query = format!("{artist} {title}").trim().to_string();
+    if query.is_empty() {
+        return None;
+    }
+    if let Some(hit) = deezer_lookup_best(client, &query, title, artist).await {
+        let url = hit
+            .pointer("/album/cover_xl")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !url.is_empty() {
+            return Some(CoverHit {
+                source: "deezer",
+                url: url.to_string(),
+                album: hit
+                    .pointer("/album/title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                artist: hit
+                    .pointer("/artist/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+    }
+
+    if let Some(url) = itunes_album_cover(client, artist, title).await {
+        return Some(CoverHit {
+            source: "apple",
+            url,
+            album: title.to_string(),
+            artist: artist.to_string(),
+        });
+    }
+    if let Some(url) = albumart_digital_cover(client, artist, title).await {
+        return Some(CoverHit {
+            source: "albumart.digital",
+            url,
+            album: title.to_string(),
+            artist: artist.to_string(),
+        });
+    }
+    None
 }
