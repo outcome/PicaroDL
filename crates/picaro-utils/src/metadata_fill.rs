@@ -2,14 +2,19 @@
 //!
 //! All sources are public, need no API key and no sign-in:
 //!   1. Deezer      - api.deezer.com/search          (title/artist/album/cover_xl)
-//!   2. iTunes      - itunes.apple.com/search        (trackName/artistName/collectionName/artworkUrl100)
-//!   3. MusicBrainz - musicbrainz.org/ws/2/recording (canonical names)
-//!   4. Cover Art Archive - coverartarchive.org/release/{mbid}
+//!   2. Apple Music - itunes.apple.com/search        (artworkUrl100 upscaled to 3000x3000)
+//!   3. albumart.digital - albumart.digital/api      (scrapes up-to-4000x4000 Apple artwork)
+//!   4. iTunes      - itunes.apple.com/search        (trackName/artistName/collectionName)
+//!   5. MusicBrainz - musicbrainz.org/ws/2/recording (canonical names)
+//!   6. Cover Art Archive - coverartarchive.org/release/{mbid}
 //!
 //! Fields are only filled when currently empty, so existing module metadata is
 //! never overwritten.
 
+use std::sync::OnceLock;
+
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use regex::Regex;
 use serde_json::Value;
 
 use crate::models::TrackInfo;
@@ -102,6 +107,138 @@ async fn itunes_lookup(client: &reqwest::Client, query: &str) -> Option<Value> {
     v.get("results")?.as_array()?.first().cloned()
 }
 
+/// Bump an iTunes artwork URL (`.../100x100bb.jpg`) to a high-resolution
+/// rendition (`.../3000x3000bb.jpg`). Returns `None` for empty input.
+fn upscale_artwork(url: &str) -> Option<String> {
+    let u = url.trim();
+    if u.is_empty() {
+        return None;
+    }
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\d+x\d+bb").expect("valid artwork-size regex"));
+    if re.is_match(u) {
+        Some(re.replace(u, "3000x3000bb").to_string())
+    } else {
+        Some(u.to_string())
+    }
+}
+
+/// Native high-res Apple Music artwork via the public iTunes Search API.
+///
+/// Uses `entity=album` so we get the canonical release artwork rather than a
+/// track thumbnail, scores every candidate against the wanted artist/album and
+/// returns the `artworkUrl100` upscaled to 3000x3000.
+async fn itunes_album_cover(
+    client: &reqwest::Client,
+    artist: &str,
+    title: &str,
+) -> Option<String> {
+    let query = format!("{artist} {title}").trim().to_string();
+    if query.is_empty() {
+        return None;
+    }
+    let url = format!(
+        "https://itunes.apple.com/search?term={}&entity=album&limit=10",
+        enc(&query)
+    );
+    let v = get_json(client, &url).await?;
+    let arr = v.get("results")?.as_array()?;
+    let bad = [
+        "karaoke",
+        "tribute",
+        "greatest hits",
+        "compilation",
+        "cover version",
+        "made famous",
+    ];
+    let mut best: Option<(f64, String)> = None;
+    for it in arr {
+        let name = it
+            .get("collectionName")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let a_name = it.get("artistName").and_then(|x| x.as_str()).unwrap_or("");
+        let art = it.get("artworkUrl100").and_then(|x| x.as_str()).unwrap_or("");
+        if art.is_empty() {
+            continue;
+        }
+        let mut score = textmatch::similarity(title, name);
+        if !artist.trim().is_empty() {
+            score += 0.5 * textmatch::similarity(artist, a_name);
+        }
+        let ln = name.to_lowercase();
+        if bad.iter().any(|b| ln.contains(b)) {
+            score -= 0.35;
+        }
+        if best.as_ref().map_or(true, |(bs, _)| score > *bs) {
+            if let Some(up) = upscale_artwork(art) {
+                best = Some((score, up));
+            }
+        }
+    }
+    best.map(|(_, u)| u)
+}
+
+fn html_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&#8217;", "'")
+}
+
+/// Scrape albumart.digital's `/api?q=` endpoint, which returns Apple Music
+/// artwork at up to 4000x4000. Picks the `<div class="album-list-item">` whose
+/// album/artist best matches the query.
+async fn albumart_digital_cover(
+    client: &reqwest::Client,
+    artist: &str,
+    title: &str,
+) -> Option<String> {
+    let query = format!("{artist} {title}").trim().to_string();
+    if query.is_empty() {
+        return None;
+    }
+    let url = format!("https://albumart.digital/api?q={}", enc(&query));
+    let resp = client
+        .get(url)
+        .header("User-Agent", UA)
+        .header("Accept", "text/html")
+        .timeout(std::time::Duration::from_secs(12))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.text().await.ok()?;
+
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r#"(?s)<div class="album-list-item">\s*<h3>(.*?)</h3>\s*<p>(.*?)</p>\s*<a href="([^"]+)""#)
+            .expect("valid albumart regex")
+    });
+    let mut best: Option<(f64, String)> = None;
+    for cap in re.captures_iter(&body) {
+        let h_title = html_unescape(cap.get(1).map(|m| m.as_str()).unwrap_or(""));
+        let h_artist = html_unescape(cap.get(2).map(|m| m.as_str()).unwrap_or(""));
+        let href = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+        if href.is_empty() {
+            continue;
+        }
+        let mut score = textmatch::similarity(title, &h_title);
+        if !artist.trim().is_empty() {
+            score += 0.5 * textmatch::similarity(artist, &h_artist);
+        }
+        if best.as_ref().map_or(true, |(bs, _)| score > *bs) {
+            best = Some((score, href.to_string()));
+        }
+    }
+    best.map(|(_, u)| u)
+}
+
 async fn musicbrainz_lookup(client: &reqwest::Client, artist: &str, title: &str) -> Option<Value> {
     let q = if artist.is_empty() {
         format!("recording:\"{title}\"")
@@ -185,7 +322,27 @@ pub async fn fill_track_metadata(
         }
     }
 
-    // 2. iTunes fallback for anything still missing (esp. cover).
+    // 2. Apple Music high-res artwork (iTunes album search -> 3000x3000).
+    if info.cover_url.trim().is_empty() {
+        if let Some(c) = itunes_album_cover(client, &artist, &title).await {
+            if !c.is_empty() {
+                info.cover_url = c;
+                filled.push("cover");
+            }
+        }
+    }
+
+    // 3. albumart.digital (scrapes up-to-4000x4000 Apple artwork).
+    if info.cover_url.trim().is_empty() {
+        if let Some(c) = albumart_digital_cover(client, &artist, &title).await {
+            if !c.is_empty() {
+                info.cover_url = c;
+                filled.push("cover");
+            }
+        }
+    }
+
+    // 4. iTunes fallback for anything still missing (esp. cover).
     let still = missing(&info.name)
         || missing(&info.album)
         || info.artists.iter().all(|a| a.trim().is_empty())
@@ -227,7 +384,7 @@ pub async fn fill_track_metadata(
         }
     }
 
-    // 3. MusicBrainz (canonical names) + Cover Art Archive for the cover.
+    // 5. MusicBrainz (canonical names) + Cover Art Archive for the cover.
     let still = missing(&info.name)
         || missing(&info.album)
         || info.artists.iter().all(|a| a.trim().is_empty())
@@ -350,6 +507,25 @@ pub async fn fill_track_metadata_force(
         }
         break;
     }
+
+    // Deezer had no usable cover: fall back to the keyless artwork sources.
+    if info.cover_url.trim().is_empty() {
+        if let Some(c) = itunes_album_cover(client, &artist_q, &title_core).await {
+            if !c.is_empty() {
+                info.cover_url = c;
+                filled.push("cover");
+            }
+        }
+    }
+    if info.cover_url.trim().is_empty() {
+        if let Some(c) = albumart_digital_cover(client, &artist_q, &title_core).await {
+            if !c.is_empty() {
+                info.cover_url = c;
+                filled.push("cover");
+            }
+        }
+    }
+
     filled.sort_unstable();
     filled.dedup();
     filled

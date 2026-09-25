@@ -126,13 +126,17 @@ impl Resolver {
                 "musicrider",
                 "intmusic",
                 "discogc",
+                "ektoplazm",
                 "coreradio",
                 "alterportal",
             ],
             QualityTier::High => vec![
+                "grimearchive",
+                "globaldjmix",
                 "zvu4it",
                 "tancpol",
                 "ccmixter",
+                "freemp3cloud",
                 "iplusfree",
                 "mp3db",
                 "soundcloud",
@@ -404,7 +408,14 @@ impl Resolver {
 fn is_direct_track(service: &str) -> bool {
     matches!(
         service,
-        "zvu4it" | "tancpol" | "ccmixter" | "soundcloud" | "youtube"
+        "zvu4it"
+            | "tancpol"
+            | "ccmixter"
+            | "soundcloud"
+            | "youtube"
+            | "grimearchive"
+            | "globaldjmix"
+            | "freemp3cloud"
     )
 }
 

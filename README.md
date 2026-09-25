@@ -22,7 +22,7 @@ Nothing waits on a slow source. Nothing asks you to log in.
 
 ## What's in it
 
-- **No sign-in anywhere in the default path.** The 23 bundled providers need no
+- **No sign-in anywhere in the default path.** The 82 bundled providers need no
   accounts.
 - **Multi-source resolver.** Sources are raced in parallel, scored for relevance,
   and tried in a sensible order that updates itself as you use it.
@@ -40,7 +40,7 @@ Nothing waits on a slow source. Nothing asks you to log in.
 
 ## Providers
 
-23 modules are bundled and usable without an account. Whether a music source can
+82 modules are bundled and usable without an account. Whether a music source can
 actually *download* depends on the third-party file host it links to — some hosts
 are dead, paywalled, or captcha-gated. The tables are honest about it:
 
@@ -59,6 +59,9 @@ are dead, paywalled, or captcha-gated. The tables are honest about it:
 | Zvu4it | MP3 | zvu4it.org |
 | Tancpol | MP3 | tancpol.net |
 | Punkcata | MP3 | punkcata.blogspot.com |
+| GlobalDJMix | MP3 | globaldjmix.com |
+| Grime Archive | MP3 | grimearchive.org |
+| Ektoplazm | MP3 / FLAC | ektoplazm.com |
 
 ### Search only (host-dependent)
 
