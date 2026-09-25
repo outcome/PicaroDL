@@ -371,6 +371,18 @@ pub fn default_global_settings() -> Map<String, Value> {
         }),
     );
     m.insert(
+        "resolver".to_string(),
+        json!({
+            "probe_timeout_secs": 4,
+            "probe_timeout_lossless_secs": 14,
+            "max_parallel": 6,
+            // Off by default: only enable if you accept tracks of an album
+            // coming from different providers / at different qualities.
+            "allow_mixed_sources": false,
+            "allow_mixed_quality": false
+        }),
+    );
+    m.insert(
         "covers".to_string(),
         json!({
             "embed_cover": true,

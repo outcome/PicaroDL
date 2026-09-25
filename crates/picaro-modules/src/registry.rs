@@ -36,6 +36,14 @@ pub static MODULE_INFO: Lazy<HashMap<String, ModuleInformation>> = Lazy::new(|| 
         crate::ektoplazm::module_information(),
     );
     m.insert(
+        "ezhevika".to_string(),
+        crate::ezhevika::module_information(),
+    );
+    m.insert(
+        "fondsound".to_string(),
+        crate::fondsound::module_information(),
+    );
+    m.insert(
         "freemp3cloud".to_string(),
         crate::freemp3cloud::module_information(),
     );
@@ -62,12 +70,12 @@ pub static MODULE_INFO: Lazy<HashMap<String, ModuleInformation>> = Lazy::new(|| 
         crate::punkcata::module_information(),
     );
     m.insert(
-        "soundcloud".to_string(),
-        crate::soundcloud::module_information(),
-    );
-    m.insert(
         "soulseek".to_string(),
         crate::soulseek::module_information(),
+    );
+    m.insert(
+        "soundcloud".to_string(),
+        crate::soundcloud::module_information(),
     );
     m.insert("tancpol".to_string(), crate::tancpol::module_information());
     m.insert("youtube".to_string(), crate::youtube::module_information());
@@ -97,6 +105,8 @@ pub fn register_all(registry: &ModuleRegistry) -> Result<()> {
     crate::dance_music::register_module(registry);
     crate::deezer_preview::register_module(registry);
     crate::ektoplazm::register_module(registry);
+    crate::ezhevika::register_module(registry);
+    crate::fondsound::register_module(registry);
     crate::freemp3cloud::register_module(registry);
     crate::globaldjmix::register_module(registry);
     crate::grimearchive::register_module(registry);
@@ -105,8 +115,8 @@ pub fn register_all(registry: &ModuleRegistry) -> Result<()> {
     crate::lyrist::register_module(registry);
     crate::musixmatch::register_module(registry);
     crate::punkcata::register_module(registry);
-    crate::soundcloud::register_module(registry);
     crate::soulseek::register_module(registry);
+    crate::soundcloud::register_module(registry);
     crate::tancpol::register_module(registry);
     crate::youtube::register_module(registry);
     crate::zvu4it::register_module(registry);

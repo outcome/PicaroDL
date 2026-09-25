@@ -51,6 +51,8 @@ pub struct Resolver {
     timeout_lossless: Duration,
     max_parallel: usize,
     min_match: f64,
+    allow_mixed_sources: bool,
+    allow_mixed_quality: bool,
     allow: Option<Vec<String>>,
     tier_order: HashMap<QualityTier, Vec<String>>,
 }
@@ -72,6 +74,8 @@ impl Resolver {
             .and_then(|v| v.as_f64())
             .unwrap_or(0.5)
             .clamp(0.0, 1.0);
+        let allow_mixed_sources = g.get_bool_or("resolver", "allow_mixed_sources", false);
+        let allow_mixed_quality = g.get_bool_or("resolver", "allow_mixed_quality", false);
         let allow = g
             .get("resolver", "providers")
             .and_then(|v| v.as_array())
@@ -110,6 +114,8 @@ impl Resolver {
             timeout_lossless,
             max_parallel,
             min_match,
+            allow_mixed_sources,
+            allow_mixed_quality,
             allow,
             tier_order,
         }
@@ -344,6 +350,16 @@ impl Resolver {
                 }
                 match hit {
                     Some(r) => {
+                        let album_based = !is_direct_track(&r.service);
+                        // Album assembly is opt-in: refuse a different tier for
+                        // an album unless `allow_mixed_quality` is set. Direct
+                        // track sources keep their full resilient fallback.
+                        if album_based && !self.allow_mixed_quality && t != tier {
+                            return Err(Error::Other(format!(
+                                "no {:?}-quality source for '{}'; set resolver.allow_mixed_quality=true to allow a different tier",
+                                tier, query
+                            )));
+                        }
                         let result = if is_direct_track(&r.service) {
                             let mut data = HashMap::new();
                             data.insert(
@@ -398,6 +414,11 @@ impl Resolver {
                                 )));
                             }
                             Err(e) => {
+                                if album_based && !self.allow_mixed_sources {
+                                    // Don't assemble an album from multiple
+                                    // providers unless explicitly allowed.
+                                    return Err(e);
+                                }
                                 warn!(
                                     "resolver: {} matched '{}' but download failed: {}",
                                     r.service, query, e

@@ -33,6 +33,50 @@ fn is_zip_archive(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_rar_archive(path: &Path) -> bool {
+    std::fs::read(path)
+        .map(|b| b.len() >= 7 && b.starts_with(b"Rar!\x1a\x07"))
+        .unwrap_or(false)
+}
+
+/// Extract a RAR archive using an external tool (`7z`/`unrar`/`unar`), since
+/// RAR is proprietary. Returns an error if none is installed.
+async fn extract_rar(archive: &Path, out: &Path) -> Result<()> {
+    let archive = archive.to_path_buf();
+    let out = out.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use std::process::Command;
+        let a = archive.to_string_lossy().to_string();
+        let o = out.to_string_lossy().to_string();
+        let attempts: [(&str, Vec<String>); 4] = [
+            (
+                "7z",
+                vec!["x".into(), "-y".into(), format!("-o{o}"), a.clone()],
+            ),
+            (
+                "7za",
+                vec!["x".into(), "-y".into(), format!("-o{o}"), a.clone()],
+            ),
+            ("unrar", vec!["x".into(), "-y".into(), a.clone(), o.clone()]),
+            ("unar", vec!["-o".into(), o.clone(), a.clone()]),
+        ];
+        for (tool, args) in attempts {
+            if which::which(tool).is_ok() {
+                if let Ok(status) = Command::new(tool).args(&args).current_dir(&out).status() {
+                    if status.success() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Err(Error::Download(
+            "rar extraction failed: install 7-Zip (7z) or unrar".into(),
+        ))
+    })
+    .await
+    .map_err(|e| Error::Download(format!("rar join: {e}")))?
+}
+
 fn is_audio_ext(path: &Path) -> bool {
     path.extension().map_or(false, |e| {
         matches!(
@@ -934,6 +978,34 @@ impl Downloader {
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| self.output_path.clone());
             extract_zip(&dest, &extract_to).await?;
+            let removed = picaro_utils::safety::purge_non_audio(&extract_to);
+            if !removed.is_empty() {
+                self.log_warn(format!(
+                    "removed {} non-audio file(s) from archive",
+                    removed.len()
+                ));
+            }
+            let _ = tokio::fs::remove_file(&dest).await;
+            if let Some(c) = &cover_path {
+                let _ = std::fs::remove_file(c);
+            }
+            if let Some(p) = find_first_audio(&extract_to) {
+                let _ = self.events.0.send(DownloadEvent::TrackSucceeded {
+                    track_id: track_id.to_string(),
+                    name: track_info.name.clone(),
+                    location: p.clone(),
+                    bytes,
+                });
+                return Ok(p);
+            }
+            return Ok(extract_to);
+        }
+        if is_rar_archive(&dest) {
+            let extract_to = dest
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| self.output_path.clone());
+            extract_rar(&dest, &extract_to).await?;
             let removed = picaro_utils::safety::purge_non_audio(&extract_to);
             if !removed.is_empty() {
                 self.log_warn(format!(

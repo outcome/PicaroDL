@@ -22,8 +22,8 @@ Nothing waits on a slow source. Nothing asks you to log in.
 
 ## What's in it
 
-- **No sign-in anywhere in the default path.** The 82 bundled providers need no
-  accounts.
+- **No sign-in anywhere in the default path.** Every bundled music source works
+  without an account (Soulseek P2P is opt-in, see below).
 - **Multi-source resolver.** Sources are raced in parallel, scored for relevance,
   and tried in a sensible order that updates itself as you use it.
 - **Quality tiers** — `lossless`, `high`, `medium`, `low` — with automatic
@@ -43,9 +43,10 @@ Nothing waits on a slow source. Nothing asks you to log in.
 
 ## Providers
 
-82 modules are bundled and usable without an account. Whether a music source can
-actually *download* depends on the third-party file host it links to — some hosts
-are dead, paywalled, or captcha-gated. The tables are honest about it:
+The bundled sources are split by what's actually verified. Many FLAC blogs link
+third-party file hosts that are dead or captcha-gated, so PicaroDL ships only the
+sources that really download — plus keyless **MEGA** support and opt-in
+**Soulseek (P2P)**.
 
 - **Download verified** — PicaroDL fetched a real file end-to-end in testing.
 - **Search only** — search and metadata resolve, but the source's file host could
@@ -65,8 +66,17 @@ are dead, paywalled, or captcha-gated. The tables are honest about it:
 | GlobalDJMix | MP3 | globaldjmix.com |
 | Grime Archive | MP3 | grimearchive.org |
 | Ektoplazm | MP3 / FLAC | ektoplazm.com |
+| Ezhevika | MP3 | ezhevika.blogspot.com (MEGA) |
+| Soulseek | FLAC / MP3 | slsknet.org (P2P, opt-in) |
+| Deezer | MP3 (30s preview) | deezer.com (signed-out) |
+| FreeMP3Cloud | MP3 | freemp3cloud.com |
+| DanceMusic | MP3 | dance-music.org |
 
 ### Search only (host-dependent)
+
+These resolve correctly but link to file hosts that are captcha-gated or dead
+(nitroflare, turbobit, hotlink, filecrypt, …), so they can't be fetched
+automatically. They stay in the tree for the day those hosts open up.
 
 | Provider | Format | Source |
 |---|---|---|
@@ -78,7 +88,6 @@ are dead, paywalled, or captcha-gated. The tables are honest about it:
 | ThemFire | FLAC | themfire.pro |
 | Mp3db | MP3 | mp3db.pro |
 | DeadPulpit | MP3 | deadpulpit.com |
-| Ezhevika | MP3 | ezhevika.blogspot.com |
 | Butterboy | MP3 | butterboycompilations.blogspot.com |
 | Primitive Offerings | MP3 | primitiveofferings.blogspot.com |
 | iPlusfree | M4A (256 kbps AAC) | iplusfree.org |
@@ -92,9 +101,10 @@ are dead, paywalled, or captcha-gated. The tables are honest about it:
 | Lyrist | lyrist.vercel.app |
 | Musixmatch | musixmatch.com |
 
-> The "search only" sources work whenever their file hosts are up and
-> auto-resolvable. MediaFire and Yandex Disk links resolve automatically;
-> captcha-gated hosts (nitroflare, turbobit, hotlink, filecrypt) do not.
+> **MEGA** (`mega.nz` file/folder links), **MediaFire**, **Yandex Disk**,
+> **pixeldrain**, **Google Drive**, **Dropbox** and **gofile** are resolved and
+> downloaded automatically — no login, no captcha. Captcha-gated hosts are not,
+> and won't be faked.
 
 ## Build
 
@@ -128,16 +138,45 @@ cargo build --release
 
 `--quality` takes `lossless`, `high`, `medium`, or `low`.
 
-## Toggles
+## Settings & toggles
 
-Three optional steps can be turned off independently in `config/settings.json`.
-All default to on.
+Everything lives in `config/settings.json`. The defaults are safe — nothing
+unexpected happens out of the box.
 
 | Setting | Default | Effect |
 |---|---|---|
-| `metadata.fetch_lyrics` | `true` | fetch and embed lyrics from the lyrics providers |
-| `metadata.fetch_cover` | `true` | download and embed album art |
+| `metadata.fetch_lyrics` | `true` | fetch + embed lyrics from the lyrics providers |
+| `metadata.fetch_cover` | `true` | download + embed album art |
 | `metadata.fill_misc` | `true` | fill missing artist / album / title / cover from free metadata services |
+| `resolver.allow_mixed_sources` | `false` | let one album's tracks come from different providers |
+| `resolver.allow_mixed_quality` | `false` | let the resolver fall back to a different quality tier |
+| `p2p.enabled` | `false` | enable Soulseek peer-to-peer traffic (also `PICARO_ENABLE_P2P=1`) |
+
+The **quality guard** only applies to **lossless** requests: if a "FLAC" is really
+a re-encoded lossy file (wrong container, or under ~500 kbps) it is rejected and
+another source is tried. Lossy tiers are taken as-is.
+
+**Mixed album assembly is opt-in.** By default an album is accepted only from a
+source at the quality you asked for — if a matching source would need a different
+quality or a different provider, it's skipped unless you enable
+`resolver.allow_mixed_quality` / `resolver.allow_mixed_sources`. Individual-track
+requests always keep their resilient multi-source fallback.
+
+### P2P / Soulseek
+
+Soulseek gives near-universal coverage (FLAC included) with no account — the
+login is generated and stored locally on first use, and regenerated automatically
+if the network ever rejects it. Because peer-to-peer traffic can be metered or
+blocked by some ISPs, it is **disabled unless you enable it** (`p2p.enabled` or
+`PICARO_ENABLE_P2P=1`).
+
+## Safety
+
+- Downloads are **magic-byte validated** and archives are purged of non-audio
+  files — a `.exe`/`.js`/`.scr` can never be dropped on you, and nothing is ever
+  executed.
+- A **quality guard** rejects fake lossless (see above).
+- **MEGA** decryption happens in-process; **Soulseek** is opt-in.
 
 ## Settings and privacy
 
@@ -158,6 +197,15 @@ point at an optional remote solver. Neither is required.
 PicaroDL hosts nothing and does not defeat authentication. It's meant for
 personal and educational use. What you download and whether it's legal where you
 live is on you — support the artists you like.
+
+## Credits
+
+PicaroDL is a Rust rewrite of, and heavily inspired by,
+**[OrpheusDL](https://github.com/OrpheusDL/OrpheusDL)** by the OrpheusDL
+contributors. The module contract, download flow, tagging and formatting logic
+all follow OrpheusDL's design — the credit for that architecture belongs to that
+project. Thanks also to the maintainers of the crates this leans on: `reqwest`,
+`lofty`, `sevenz-rust`, `zip`, `mega`, `soulseek-rs-lib`, and `ratatui`.
 
 ## License
 
