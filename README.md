@@ -22,8 +22,8 @@ Nothing waits on a slow source. Nothing asks you to log in.
 
 ## What's in it
 
-- **No sign-in anywhere in the default path.** Every bundled music source works
-  without an account (Soulseek P2P is opt-in, see below).
+- **No sign-in anywhere.** Every bundled source works without an account, and
+  Soulseek P2P is on by default (opt out with one setting).
 - **Multi-source resolver.** Sources are raced in parallel, scored for relevance,
   and tried in a sensible order that updates itself as you use it.
 - **Quality tiers** — `lossless`, `high`, `medium`, `low` — with automatic
@@ -150,7 +150,7 @@ unexpected happens out of the box.
 | `metadata.fill_misc` | `true` | fill missing artist / album / title / cover from free metadata services |
 | `resolver.allow_mixed_sources` | `false` | let one album's tracks come from different providers |
 | `resolver.allow_mixed_quality` | `false` | let the resolver fall back to a different quality tier |
-| `p2p.enabled` | `false` | enable Soulseek peer-to-peer traffic (also `PICARO_ENABLE_P2P=1`) |
+| `p2p.enabled` | `true` | Soulseek peer-to-peer (set `false` or `PICARO_ENABLE_P2P=0` to opt out) |
 
 The **quality guard** only applies to **lossless** requests: if a "FLAC" is really
 a re-encoded lossy file (wrong container, or under ~500 kbps) it is rejected and
@@ -166,9 +166,25 @@ requests always keep their resilient multi-source fallback.
 
 Soulseek gives near-universal coverage (FLAC included) with no account — the
 login is generated and stored locally on first use, and regenerated automatically
-if the network ever rejects it. Because peer-to-peer traffic can be metered or
-blocked by some ISPs, it is **disabled unless you enable it** (`p2p.enabled` or
-`PICARO_ENABLE_P2P=1`).
+if the network ever rejects it. It is **enabled by default**; if peer-to-peer
+traffic is a problem on your connection, set `p2p.enabled = false` or
+`PICARO_ENABLE_P2P=0`.
+
+### Progress for host apps
+
+When driven as a subprocess, PicaroDL prints one parseable line per event on
+stdout, so a host can show live progress:
+
+```text
+picaro started <service> <context>
+picaro track-start <name>
+picaro progress <bytes> <total|-> <name>
+picaro ok <name> <path>
+picaro skip <name> <path>
+picaro fail <name> <reason>
+picaro finished <ok> <skipped> <failed>
+picaro error <message>
+```
 
 ## Safety
 

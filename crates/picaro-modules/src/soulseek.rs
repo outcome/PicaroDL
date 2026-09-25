@@ -85,12 +85,13 @@ fn nested_bool(controller: &ModuleController, parent: &str, key: &str) -> Option
         .and_then(|v| v.as_bool())
 }
 
-/// Whether P2P is enabled. Defaults to `false`. The `PICARO_ENABLE_P2P`
-/// environment variable, when set, overrides the module setting.
+/// Whether P2P is enabled. Defaults to `true`; set `p2p.enabled = false` (or
+/// `PICARO_ENABLE_P2P=0`) to opt out. The environment variable, when set,
+/// overrides the module setting.
 fn p2p_enabled(controller: &ModuleController) -> bool {
     let from_settings = nested_bool(controller, "p2p", "enabled")
         .or_else(|| setting_bool(controller, "p2p_enabled"))
-        .unwrap_or(false);
+        .unwrap_or(true);
     match std::env::var("PICARO_ENABLE_P2P") {
         Ok(v) => truthy(&v),
         Err(_) => from_settings,
@@ -114,8 +115,9 @@ pub fn module_information() -> ModuleInformation {
         module_supported_modes: ModuleModes::download,
         global_settings: {
             let mut m = indexmap::IndexMap::new();
-            // Off by default: P2P can be metered or blocked by an ISP.
-            m.insert("p2p".to_string(), json!({ "enabled": false }));
+            // On by default (best coverage, incl. lossless). Set false to opt
+            // out of peer-to-peer traffic.
+            m.insert("p2p".to_string(), json!({ "enabled": true }));
             m
         },
         global_storage_variables: vec![],

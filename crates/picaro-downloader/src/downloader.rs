@@ -174,6 +174,7 @@ pub enum DownloadEvent {
     },
     TrackProgress {
         track_id: String,
+        name: String,
         bytes: u64,
         total: Option<u64>,
     },
@@ -495,7 +496,11 @@ impl Downloader {
                         &url,
                         &dest,
                         Some(headers),
-                        DownloadProgress::hidden(),
+                        DownloadProgress::reporting(
+                            self.events.0.clone(),
+                            track_id.to_string(),
+                            track_info.name.clone(),
+                        ),
                     )
                     .await?
                 }
@@ -920,7 +925,11 @@ impl Downloader {
                         &url,
                         &dest,
                         Some(headers),
-                        DownloadProgress::hidden(),
+                        DownloadProgress::reporting(
+                            self.events.0.clone(),
+                            track_id.to_string(),
+                            track_info.name.clone(),
+                        ),
                     )
                     .await?
                 }

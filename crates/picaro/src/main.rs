@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use picaro_core::Picaro;
-use picaro_downloader::Downloader;
+use picaro_downloader::{DownloadEvent, Downloader};
 use picaro_utils::ModuleRegistry;
 
 #[derive(Parser, Debug)]
@@ -477,7 +477,65 @@ fn make_downloader(picaro: Arc<Picaro>, cli: &Cli) -> Arc<Downloader> {
         })
         .unwrap_or_else(|| PathBuf::from("./downloads"));
     std::fs::create_dir_all(&download_path).ok();
-    Arc::new(Downloader::new(picaro, download_path))
+    let downloader = Arc::new(Downloader::new(picaro, download_path));
+    spawn_progress_printer(&downloader);
+    downloader
+}
+
+/// Print download events as one parseable line each on stdout, so a host
+/// process (TUI, or an embedding app) can render live progress. Format:
+///
+/// ```text
+/// picaro started <service> <context>
+/// picaro track-start <name>
+/// picaro progress <bytes> <total|-> <name>
+/// picaro ok <name> <path>
+/// picaro skip <name> <path>
+/// picaro fail <name> <reason>
+/// picaro finished <ok> <skipped> <failed>
+/// picaro error <message>
+/// ```
+fn spawn_progress_printer(downloader: &Arc<Downloader>) {
+    let rx = downloader.receiver();
+    std::thread::spawn(move || {
+        for event in rx.iter() {
+            match event {
+                DownloadEvent::Started { service, context } => {
+                    println!("picaro started {service} {context}");
+                }
+                DownloadEvent::TrackStarted { name, .. } => {
+                    println!("picaro track-start {name}");
+                }
+                DownloadEvent::TrackProgress {
+                    name, bytes, total, ..
+                } => match total {
+                    Some(t) => println!("picaro progress {bytes} {t} {name}"),
+                    None => println!("picaro progress {bytes} - {name}"),
+                },
+                DownloadEvent::TrackSucceeded { name, location, .. } => {
+                    println!("picaro ok {name} {}", location.display());
+                }
+                DownloadEvent::TrackSkipped { name, location, .. } => {
+                    println!("picaro skip {name} {}", location.display());
+                }
+                DownloadEvent::TrackFailed { name, reason, .. } => {
+                    println!("picaro fail {name} {reason}");
+                }
+                DownloadEvent::Finished {
+                    succeeded,
+                    skipped,
+                    failed,
+                    ..
+                } => {
+                    println!("picaro finished {succeeded} {skipped} {failed}");
+                }
+                DownloadEvent::Error { message } => {
+                    println!("picaro error {message}");
+                }
+                DownloadEvent::Log { .. } | DownloadEvent::SearchResults { .. } => {}
+            }
+        }
+    });
 }
 
 fn main() {

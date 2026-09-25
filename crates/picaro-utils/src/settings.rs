@@ -367,7 +367,9 @@ pub fn default_global_settings() -> Map<String, Value> {
     m.insert(
         "p2p".to_string(),
         json!({
-            "enabled": false
+            // Enabled by default: Soulseek gives near-universal coverage
+            // (incl. lossless). Set to false if your ISP meters/blocks P2P.
+            "enabled": true
         }),
     );
     m.insert(

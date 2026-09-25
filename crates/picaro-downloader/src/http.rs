@@ -15,9 +15,18 @@ use indicatif::{ProgressBar, ProgressStyle};
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-/// Track a single in-flight download with an optional progress bar.
+/// Track a single in-flight download with an optional progress bar and/or
+/// progress events on the downloader's channel.
 pub struct DownloadProgress {
     pub bar: Option<ProgressBar>,
+    reporter: Option<ProgressReporter>,
+}
+
+struct ProgressReporter {
+    tx: crossbeam_channel::Sender<crate::downloader::DownloadEvent>,
+    track_id: String,
+    name: String,
+    sent: std::cell::Cell<u64>,
 }
 
 impl Drop for DownloadProgress {
@@ -30,7 +39,10 @@ impl Drop for DownloadProgress {
 
 impl DownloadProgress {
     pub fn hidden() -> Self {
-        Self { bar: None }
+        Self {
+            bar: None,
+            reporter: None,
+        }
     }
 
     pub fn with_bar(bytes: u64, label: &str) -> Self {
@@ -42,13 +54,54 @@ impl DownloadProgress {
                 .progress_chars("##-"),
         );
         bar.set_message(label.to_string());
-        Self { bar: Some(bar) }
+        Self {
+            bar: Some(bar),
+            reporter: None,
+        }
+    }
+
+    /// Emit `DownloadEvent::TrackProgress` on the downloader's event channel, so
+    /// the CLI/TUI (or an embedding host) can render live progress.
+    pub fn reporting(
+        tx: crossbeam_channel::Sender<crate::downloader::DownloadEvent>,
+        track_id: String,
+        name: String,
+    ) -> Self {
+        Self {
+            bar: None,
+            reporter: Some(ProgressReporter {
+                tx,
+                track_id,
+                name,
+                sent: std::cell::Cell::new(0),
+            }),
+        }
     }
 
     pub fn update(&self, delta: u64) {
         if let Some(bar) = &self.bar {
             bar.inc(delta);
         }
+    }
+
+    /// Report cumulative progress. Throttled to ~256 KiB steps (plus the first
+    /// and last update) so the event channel isn't flooded.
+    pub fn report(&self, bytes: u64, total: u64) {
+        let Some(r) = &self.reporter else {
+            return;
+        };
+        let prev = r.sent.get();
+        let finished = total > 0 && bytes >= total;
+        if bytes != 0 && !finished && bytes < prev + 262_144 {
+            return;
+        }
+        r.sent.set(bytes);
+        let _ = r.tx.send(crate::downloader::DownloadEvent::TrackProgress {
+            track_id: r.track_id.clone(),
+            name: r.name.clone(),
+            bytes,
+            total: if total > 0 { Some(total) } else { None },
+        });
     }
 }
 
@@ -82,12 +135,14 @@ pub async fn download_to_path(
     }
     let mut resp = req.send().await?.error_for_status()?;
     let total = resp.content_length().unwrap_or(0);
+    progress.report(0, total);
     let mut file = fs::File::create(dest).await?;
     let mut bytes: u64 = 0;
     while let Some(chunk) = resp.chunk().await? {
         file.write_all(&chunk).await?;
         bytes += chunk.len() as u64;
         progress.update(chunk.len() as u64);
+        progress.report(bytes, total);
     }
     file.flush().await?;
     if let Some(bar) = &progress.bar {
