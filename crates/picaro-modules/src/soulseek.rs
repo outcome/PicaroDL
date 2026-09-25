@@ -8,15 +8,15 @@
 //! # P2P safety toggle
 //!
 //! Soulseek traffic is peer-to-peer and some ISPs bill, throttle or block P2P.
-//! For that reason this module is **disabled unless explicitly enabled**:
+//! This module is therefore **on by default but easy to opt out**:
 //!
-//! * Set the environment variable `PICARO_ENABLE_P2P=1` (also accepts
-//!   `true`/`yes`/`on`), **or**
-//! * set the module setting `p2p.enabled = true` (see `global_settings`, which
-//!   defaults to `false`).
+//! * Set the environment variable `PICARO_ENABLE_P2P=0` (also accepts
+//!   `false`/`no`/`off`) to force it off, **or**
+//! * set the module setting `p2p.enabled = false` (see `global_settings`, which
+//!   defaults to `true`).
 //!
-//! The environment variable wins when present, so `PICARO_ENABLE_P2P=0` can be
-//! used to force it off. While disabled, `search()` and `get_track_download()`
+//! The environment variable wins when present, so `PICARO_ENABLE_P2P=1` can be
+//! used to force it back on. While disabled, `search()` and `get_track_download()`
 //! return an error explaining how to turn it on; nothing touches the network.
 //!
 //! # Downloading

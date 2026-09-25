@@ -48,10 +48,6 @@ third-party file hosts that are dead or captcha-gated, so those sources are
 **disabled** (kept out of the build) rather than shipped broken. What's enabled is
 verified end-to-end, and includes keyless **MEGA** support and **Soulseek (P2P)**.
 
-- **Download verified** — PicaroDL fetched a real file end-to-end in testing.
-- **Search only** — search and metadata resolve, but the source's file host could
-  not be downloaded automatically.
-
 ### Download verified
 
 | Provider | Format | Source |
@@ -67,7 +63,7 @@ verified end-to-end, and includes keyless **MEGA** support and **Soulseek (P2P)*
 | Grime Archive | MP3 | grimearchive.org |
 | Ektoplazm | MP3 / FLAC | ektoplazm.com |
 | Ezhevika | MP3 | ezhevika.blogspot.com (MEGA) |
-| Soulseek | FLAC / MP3 | slsknet.org (P2P, opt-in) |
+| Soulseek | FLAC / MP3 | slsknet.org (P2P, on by default) |
 | Deezer | MP3 (30s preview) | deezer.com (signed-out) |
 | FreeMP3Cloud | MP3 | freemp3cloud.com |
 | DanceMusic | MP3 | dance-music.org |
@@ -173,7 +169,7 @@ picaro error <message>
   files — a `.exe`/`.js`/`.scr` can never be dropped on you, and nothing is ever
   executed.
 - A **quality guard** rejects fake lossless (see above).
-- **MEGA** decryption happens in-process; **Soulseek** is opt-in.
+- **MEGA** decryption happens in-process; **Soulseek** is on by default (see above).
 
 ## Settings and privacy
 
