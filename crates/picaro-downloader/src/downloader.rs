@@ -481,22 +481,33 @@ impl Downloader {
                         &track_info.name,
                     )
                     .await?;
-                    match crate::mega::pick_best_file(&files, &track_info.name) {
-                        Some(chosen) => {
-                            let chosen = chosen.to_path_buf();
-                            let len = tokio::fs::metadata(&chosen).await?.len();
-                            dest = chosen;
-                            Some(len)
-                        }
-                        None => None,
-                    }
-                };
-                if let Some(bytes) = torrent_bytes {
-                    bytes
-                } else {
-                // Keyless MEGA public links are fetched via the `mega` crate
-                // rather than the generic hoster resolver.
-                let mega_bytes = 'mega: {
+ match crate::mega::pick_best_file(&files, &track_info.name) {
+ Some(chosen) => {
+ let chosen = chosen.to_path_buf();
+ let len = tokio::fs::metadata(&chosen).await?.len();
+ // See `download_track`: reject magnet grabs
+ // that don't match a known-good reference.
+ let dirs = crate::fingerprint::default_search_dirs();
+ if let Err(e) = crate::fingerprint::verify_against_reference(
+ &chosen,
+ &track_info.name,
+ &dirs,
+ ) {
+ let _ = tokio::fs::remove_file(&chosen).await;
+ return Err(e);
+ }
+ dest = chosen;
+ Some(len)
+ }
+ None => None,
+ }
+ };
+ if let Some(bytes) = torrent_bytes {
+ bytes
+ } else {
+ // Keyless MEGA public links are fetched via the `mega` crate
+ // rather than the generic hoster resolver.
+ let mega_bytes = 'mega: {
                     if !crate::mega::is_mega(&url) {
                         break 'mega None;
                     }
@@ -1062,22 +1073,33 @@ impl Downloader {
                         &track_info.name,
                     )
                     .await?;
-                    match crate::mega::pick_best_file(&files, &track_info.name) {
-                        Some(chosen) => {
-                            let chosen = chosen.to_path_buf();
-                            let len = tokio::fs::metadata(&chosen).await?.len();
-                            dest = chosen;
-                            Some(len)
-                        }
-                        None => None,
-                    }
-                };
-                if let Some(bytes) = torrent_bytes {
-                    bytes
-                } else {
-                // Keyless MEGA public links are fetched via the `mega` crate
-                // rather than the generic hoster resolver.
-                let mega_bytes = 'mega: {
+ match crate::mega::pick_best_file(&files, &track_info.name) {
+ Some(chosen) => {
+ let chosen = chosen.to_path_buf();
+ let len = tokio::fs::metadata(&chosen).await?.len();
+ // See `download_track`: reject magnet grabs
+ // that don't match a known-good reference.
+ let dirs = crate::fingerprint::default_search_dirs();
+ if let Err(e) = crate::fingerprint::verify_against_reference(
+ &chosen,
+ &track_info.name,
+ &dirs,
+ ) {
+ let _ = tokio::fs::remove_file(&chosen).await;
+ return Err(e);
+ }
+ dest = chosen;
+ Some(len)
+ }
+ None => None,
+ }
+ };
+ if let Some(bytes) = torrent_bytes {
+ bytes
+ } else {
+ // Keyless MEGA public links are fetched via the `mega` crate
+ // rather than the generic hoster resolver.
+ let mega_bytes = 'mega: {
                     if !crate::mega::is_mega(&url) {
                         break 'mega None;
                     }

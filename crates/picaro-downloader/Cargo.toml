@@ -44,6 +44,7 @@ base64.workspace = true
 quick-xml.workspace = true
 sevenz-rust.workspace = true
 librqbit.workspace = true
+lofty.workspace = true
 zip.workspace = true
 log = "0.4"
 env_logger = "0.11"

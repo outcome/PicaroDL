@@ -19,6 +19,22 @@ use std::time::Duration;
 use librqbit::{AddTorrent, AddTorrentOptions, AddTorrentResponse, Session, SessionOptions};
 use tracing::{debug, info};
 
+/// Public UDP trackers merged into every magnet add so peer discovery
+/// doesn't depend on the single tracker baked into the magnet. The
+/// magnet's own `&tr=` params are kept; these are added on top.
+const EXTRA_TRACKERS: &[&str] = &[
+ "udp://tracker.opentrackr.org:1337/announce",
+ "udp://tracker.openbittorrent.com:80/announce",
+ "udp://tracker.torrent.eu.org:451/announce",
+ "udp://opentracker.i2p.rocks:6969/announce",
+ "udp://tracker.tiny-vps.com:6969/announce",
+ "udp://retracker01-msk.cmdnet.ru:8080/announce",
+ "udp://tracker.dler.org:6969/announce",
+ "udp://tracker.moeking.me:6969/announce",
+ "udp://ipv4.tracker.harry.lu:80/announce",
+ "udp://explodie.org:6969/announce",
+];
+
 use picaro_utils::error::{Error, Result};
 
 use crate::downloader::DownloadEvent;
@@ -105,30 +121,35 @@ pub async fn download_magnet(
     }
     tokio::fs::create_dir_all(output_dir).await?;
 
-    let mut opts = SessionOptions {
-        disable_dht: !settings.dht,
-        ..Default::default()
-    };
-    if settings.listen_port > 0 {
-        let p = settings.listen_port;
-        opts.listen_port_range = Some(p..p.saturating_add(1).max(p + 1));
-    }
+ let mut opts = SessionOptions {
+ disable_dht: !settings.dht,
+ ..Default::default()
+ };
+ // Always bind a TCP listener. When listen_port=0 the OS picks an
+ // ephemeral port; without a listener, no incoming peer connections
+ // are accepted and downloads stall on cold DHT caches.
+ let p = settings.listen_port;
+ opts.listen_port_range = Some(p..p.saturating_add(1).max(p + 1));
 
     let session = Session::new_with_opts(output_dir.to_path_buf(), opts)
         .await
         .map_err(|e| Error::Download(format!("torrent: session init: {e}")))?;
 
-    // 1. Enumerate the torrent's files without downloading anything.
-    let list_resp = session
-        .add_torrent(
-            AddTorrent::from_url(magnet.to_string()),
-            Some(AddTorrentOptions {
-                list_only: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .map_err(|e| Error::Download(format!("torrent: metadata fetch failed: {e}")))?;
+ // 1. Enumerate the torrent's files without downloading anything.
+ // Merge in the extra tracker list so the metadata fetch doesn't
+ // depend on the single tracker baked into the magnet.
+ let list_trackers: Vec<String> = EXTRA_TRACKERS.iter().map(|s| s.to_string()).collect();
+ let list_resp = session
+ .add_torrent(
+ AddTorrent::from_url(magnet.to_string()),
+ Some(AddTorrentOptions {
+ list_only: true,
+ trackers: Some(list_trackers),
+ ..Default::default()
+ }),
+ )
+ .await
+ .map_err(|e| Error::Download(format!("torrent: metadata fetch failed: {e}")))?;
 
     let listing = match list_resp {
         AddTorrentResponse::ListOnly(l) => l,
@@ -179,18 +200,23 @@ pub async fn download_magnet(
         size_gb
     );
 
-    // 3. Re-add the magnet, requesting only the audio files.
-    let added = session
-        .add_torrent(
-            AddTorrent::from_url(magnet.to_string()),
-            Some(AddTorrentOptions {
-                only_files: Some(audio_indices),
-                overwrite: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .map_err(|e| Error::Download(format!("torrent: add failed: {e}")))?;
+ // 3. Re-add the magnet, requesting only the audio files. Merge in
+ // the extra tracker list on this add too — the magnet's own `&tr=`
+ // params may point at a dead tracker, and we need a working peer
+ // source for the real download (not just the metadata fetch).
+ let add_trackers: Vec<String> = EXTRA_TRACKERS.iter().map(|s| s.to_string()).collect();
+ let added = session
+ .add_torrent(
+ AddTorrent::from_url(magnet.to_string()),
+ Some(AddTorrentOptions {
+ only_files: Some(audio_indices),
+ overwrite: true,
+ trackers: Some(add_trackers),
+ ..Default::default()
+ }),
+ )
+ .await
+ .map_err(|e| Error::Download(format!("torrent: add failed: {e}")))?;
 
     let handle = added
         .into_handle()

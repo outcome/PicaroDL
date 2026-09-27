@@ -1,6 +1,7 @@
 //! Public API for the downloader crate.
 
 pub mod downloader;
+pub mod fingerprint;
 pub mod globals;
 pub mod hosters;
 pub mod http;
