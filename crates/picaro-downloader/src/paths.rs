@@ -68,7 +68,20 @@ pub fn build_album_path(
         .and_then(|v| v.as_str())
         .unwrap_or("{artist}/{name}")
         .to_string();
-    let name = format_template(&template, &vars);
+    let mut name = format_template(&template, &vars);
+    // A template like "{artist}/{name}" with an empty artist yields a leading
+    // separator; `Path::join` would treat that as absolute and escape `root`
+    // (writing to the drive root). Trim leading separators and collapse dupes.
+    while name.contains("//") {
+        name = name.replace("//", "/");
+    }
+    while name.contains(r"\\") {
+        name = name.replace(r"\\", r"\");
+    }
+    name = name.trim_start_matches(['/', '\\']).to_string();
+    if name.is_empty() {
+        name = "Unknown Album".to_string();
+    }
     let candidate = root.join(name);
     let final_path = fix_byte_limit(candidate, 250);
     Ok(final_path)

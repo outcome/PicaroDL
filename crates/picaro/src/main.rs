@@ -198,6 +198,13 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             downloader.download_artist(&service, &artist_id).await?;
         }
         Command::Url { url } => {
+            // BitTorrent magnet links never reach a module; hand them to the
+            // torrent engine directly.
+            if url.trim_start().starts_with("magnet:") {
+                let downloader = make_downloader(picaro.clone(), &cli);
+                downloader.download_magnet_url(url.trim()).await?;
+                return Ok(());
+            }
             let parsed = url::Url::parse(&url).map_err(|e| anyhow::anyhow!("Invalid URL: {e}"))?;
             let host = parsed.host_str().unwrap_or("").to_lowercase();
             let service = picaro_utils::url_decode::netloc_to_module(&host, picaro.registry())

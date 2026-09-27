@@ -7,6 +7,8 @@ pub mod http;
 pub mod mega;
 pub mod paths;
 pub mod resolver;
+pub mod torrent;
 
 pub use downloader::{DownloadEvent, Downloader, LogLevel};
 pub use globals::GlobalSettings;
+pub use torrent::{download_magnet, TorrentSettings};

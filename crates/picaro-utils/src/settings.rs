@@ -373,6 +373,24 @@ pub fn default_global_settings() -> Map<String, Value> {
         }),
     );
     m.insert(
+        "torrent".to_string(),
+        json!({
+            // BitTorrent (magnet) index sources. OFF by default: only enable
+            // if peer-to-peer traffic is acceptable on your connection.
+            "enabled": false,
+            // Only results with at least this many seeders are used.
+            "min_seeders": 5,
+            // Refuse torrents larger than this (whole release, in GB).
+            "max_size_gb": 8,
+            // Mainline DHT (needed for magnet-only results).
+            "dht": true,
+            // 0 = random. Change if you need a fixed inbound port.
+            "listen_port": 0,
+            // Keep seeding after the download completes.
+            "seed": false
+        }),
+    );
+    m.insert(
         "resolver".to_string(),
         json!({
             "probe_timeout_secs": 4,

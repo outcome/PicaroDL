@@ -64,7 +64,7 @@ verified end-to-end, and includes keyless **MEGA** support and **Soulseek (P2P)*
 | Ektoplazm | MP3 / FLAC | ektoplazm.com |
 | Ezhevika | MP3 | ezhevika.blogspot.com (MEGA) |
 | Soulseek | FLAC / MP3 | slsknet.org (P2P, on by default) |
-| Deezer | MP3 (30s preview) | deezer.com (signed-out) |
+| PirateBay | FLAC / MP3 (torrent) | thepiratebay.org via apibay.org (BitTorrent, opt-in) |
 | FreeMP3Cloud | MP3 | freemp3cloud.com |
 | DanceMusic | MP3 | dance-music.org |
 | FondSound | M4A | fondsound.com (MEGA) |
@@ -128,6 +128,9 @@ unexpected happens out of the box.
 | `resolver.allow_mixed_sources` | `false` | let one album's tracks come from different providers |
 | `resolver.allow_mixed_quality` | `false` | let the resolver fall back to a different quality tier |
 | `p2p.enabled` | `true` | Soulseek peer-to-peer (set `false` or `PICARO_ENABLE_P2P=0` to opt out) |
+| `torrent.enabled` | `false` | BitTorrent magnet downloads (PirateBay results); opt in to allow P2P torrent traffic |
+| `torrent.min_seeders` | `5` | ignore torrents with fewer seeders |
+| `torrent.max_size_gb` | `8` | refuse torrents larger than this (whole release) |
 
 The **quality guard** only applies to **lossless** requests: if a "FLAC" is really
 a re-encoded lossy file (wrong container, or under ~500 kbps) it is rejected and
@@ -146,6 +149,18 @@ login is generated and stored locally on first use, and regenerated automaticall
 if the network ever rejects it. It is **enabled by default**; if peer-to-peer
 traffic is a problem on your connection, set `p2p.enabled = false` or
 `PICARO_ENABLE_P2P=0`.
+
+### BitTorrent / torrents
+
+PirateBay results are magnet links. Torrent support is **off by default**
+(`torrent.enabled = false`) because it is peer-to-peer traffic; enable it to let
+PicaroDL download them. When enabled, a magnet's files are listed first, only the
+audio entries are fetched, and files above `torrent.max_size_gb` are refused. You
+can also hand PicaroDL a magnet directly:
+
+```bash
+./target/release/picaro url "magnet:?xt=urn:btih:..."
+```
 
 ### Progress for host apps
 

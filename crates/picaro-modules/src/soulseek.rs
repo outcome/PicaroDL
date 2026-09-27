@@ -412,31 +412,139 @@ fn strip_track_number(name: &str) -> &str {
     }
 }
 
-fn split_artist_title(stem: &str) -> (Option<String>, String) {
-    let stem = strip_track_number(stem);
-    if let Some((artist, title)) = stem.split_once(" - ") {
+/// Soulseek filenames predate UTF-8: peers send legacy charmap bytes and the
+/// client decodes them lossily, which surfaces as U+FFFD where an en/em dash or
+/// accented byte used to be. Repair the common cases so titles/artists come out
+/// clean, and collapse the dash family to an ASCII hyphen.
+fn sanitize_slsk_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\u{FFFD}' => out.push('-'),
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => out.push('-'),
+            '\u{00A0}' => out.push(' '),
+            '_' => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn split_artist_title(name: &str) -> (Option<String>, String) {
+    let stem = strip_track_number(name);
+    let clean = sanitize_slsk_text(stem);
+    let clean = clean.trim();
+    if let Some((artist, title)) = clean.split_once(" - ") {
         let artist = artist.trim();
         let title = title.trim();
         if !artist.is_empty() && !title.is_empty() {
             return (Some(artist.to_string()), title.to_string());
         }
     }
-    (None, stem.trim().to_string())
+    (None, clean.to_string())
+}
+
+/// Directory names that carry no artist/album information.
+const GENERIC_SLSK_DIRS: &[&str] = &[
+    "music", "musik", "mp3", "mp3s", "audio", "albums", "album", "songs", "song",
+    "my music", "shared", "shared folder", "downloads", "download", "compilations",
+    "compilation", "various artists", "va", "unsorted", "lossless", "flac", "tracks",
+    "cd", "covers", "incoming", "complete", "incomplete", "temp", "new folder",
+];
+
+fn is_generic_dir(d: &str) -> bool {
+    let l = d.trim().to_ascii_lowercase();
+    l.is_empty()
+        || l.starts_with("@@")
+        || GENERIC_SLSK_DIRS.contains(&l.as_str())
+        || l.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Drop a trailing `(2016)` / `[2016]` year tag from an album/dir name.
+fn strip_year(s: &str) -> String {
+    let mut out = s.trim().to_string();
+    for (open, close) in [('(', ')'), ('[', ']')] {
+        if out.ends_with(close) {
+            if let Some(idx) = out.rfind(open) {
+                let inside = &out[idx + 1..out.len() - 1];
+                if inside.chars().any(|c| c.is_ascii_digit())
+                    && inside
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '-' || c == ' ')
+                {
+                    out = out[..idx].trim().to_string();
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Parse a full Soulseek path into `(artist, album, title)`. Soulseek libraries
+/// are usually `<...>/<Artist>/<Album>/<track>.<ext>` or
+/// `<...>/<Artist> - <Title>.<ext>`, so the artist/album often live in the
+/// directories rather than the filename.
+fn parse_slsk_location(full: &str) -> (Option<String>, String, String) {
+    let norm = full.replace('/', "\\");
+    let parts: Vec<&str> = norm.split('\\').filter(|p| !p.is_empty()).collect();
+    let stem = strip_extension(basename(full));
+    let (mut artist, title) = split_artist_title(stem);
+
+    let dirs: Vec<String> = parts
+        .iter()
+        .take(parts.len().saturating_sub(1))
+        .map(|d| sanitize_slsk_text(d).trim().to_string())
+        .filter(|d| !is_generic_dir(d))
+        .collect();
+
+    let mut album = dirs.last().map(|d| strip_year(d)).unwrap_or_default();
+    if artist.is_none() {
+        match dirs.len() {
+            0 => {}
+            1 => {
+                let d = &dirs[0];
+                if let Some((a, al)) = d.split_once(" - ") {
+                    if !a.trim().is_empty() {
+                        artist = Some(a.trim().to_string());
+                    }
+                    if !al.trim().is_empty() {
+                        album = al.trim().to_string();
+                    }
+                } else {
+                    artist = Some(strip_year(d));
+                    album = String::new();
+                }
+            }
+            _ => artist = Some(strip_year(&dirs[dirs.len() - 2])),
+        }
+    }
+    // `<Artist>/<track>` has no album; don't tag the artist as the album.
+    if let Some(a) = &artist {
+        if album.eq_ignore_ascii_case(a) {
+            album.clear();
+        }
+    }
+    (artist, album, title)
 }
 
 fn file_to_search_result(user: &str, file: &SlskFile) -> SearchResult {
-    let stem = strip_extension(basename(&file.name));
-    let (artist, title) = split_artist_title(stem);
+    let (artist, album, title) = parse_slsk_location(&file.name);
     // Soulseek attribute 1 is duration in seconds.
     let duration = file.attribs.get(&1).copied().filter(|seconds| *seconds > 0);
     let name = if title.is_empty() {
-        stem.to_string()
+        sanitize_slsk_text(strip_extension(basename(&file.name)))
+            .trim()
+            .to_string()
     } else {
         title
     };
     let mut extra = serde_json::Map::new();
     extra.insert("size".to_string(), json!(file.size));
     extra.insert("username".to_string(), json!(user));
+    if !album.is_empty() {
+        extra.insert("album".to_string(), json!(album));
+    }
     SearchResult {
         result_id: encode_ref(user, &file.name, file.size),
         name: if name.is_empty() { None } else { Some(name) },
@@ -708,19 +816,37 @@ impl picaro_utils::module::ModuleInterface for SoulseekModule {
         track_id: &str,
         _quality: Quality,
         _codec: &CodecOptions,
-        _data: HashMap<String, Value>,
+        data: HashMap<String, Value>,
     ) -> Result<TrackInfo> {
         let reference = parse_ref(track_id)?;
-        let stem = strip_extension(basename(&reference.f));
-        let (artist, title) = split_artist_title(stem);
+        let (mut artist, mut album, mut title) = parse_slsk_location(&reference.f);
+        // The resolver hands us the metadata of the search result it scored
+        // against the user's query - prefer it over the raw filename.
+        if let Some(n) = data.get("__track_name__").and_then(|v| v.as_str()) {
+            if !n.trim().is_empty() {
+                title = n.trim().to_string();
+            }
+        }
+        if let Some(a) = data.get("__artist__").and_then(|v| v.as_str()) {
+            if !a.trim().is_empty() {
+                artist = Some(a.trim().to_string());
+            }
+        }
+        if let Some(al) = data.get("album").and_then(|v| v.as_str()) {
+            if album.trim().is_empty() && !al.trim().is_empty() {
+                album = al.trim().to_string();
+            }
+        }
         let name = if title.is_empty() {
-            stem.to_string()
+            sanitize_slsk_text(strip_extension(basename(&reference.f)))
+                .trim()
+                .to_string()
         } else {
             title
         };
         Ok(TrackInfo {
             name,
-            album: String::new(),
+            album,
             album_id: String::new(),
             artists: artist.into_iter().collect(),
             codec: codec_for_name(&reference.f),

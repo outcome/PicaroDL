@@ -182,7 +182,7 @@ impl picaro_utils::module::ModuleInterface for Zvu4itModule {
         data: HashMap<String, Value>,
     ) -> Result<TrackInfo> {
         let meta = data.get("__album_meta__").cloned();
-        let (album, artist, cover) = match meta {
+        let (album, mut artist, cover) = match meta {
             Some(v) => (
                 v.get("album")
                     .and_then(|x| x.as_str())
@@ -200,7 +200,7 @@ impl picaro_utils::module::ModuleInterface for Zvu4itModule {
             None => (String::new(), String::new(), String::new()),
         };
         let derived = track_name_from_url(track_id);
-        let name = data
+        let mut name = data
             .get("__track_name__")
             .and_then(|x| x.as_str())
             .map(|s| s.to_string())
@@ -213,6 +213,23 @@ impl picaro_utils::module::ModuleInterface for Zvu4itModule {
                     track_id.to_string()
                 }
             });
+        // The resolver scored this result for the user's query; trust its
+        // artist when the page didn't give us one.
+        if artist.is_empty() {
+            if let Some(a) = data.get("__artist__").and_then(|x| x.as_str()) {
+                artist = a.to_string();
+            }
+        }
+        // Site titles are "Artist · Title" / "Artist - Title"; drop the prefix
+        // so the artist isn't duplicated by the filename/tag template.
+        if !artist.is_empty() {
+            for sep in [" - ", " · ", " – ", " — ", " | "] {
+                if let Some(rest) = name.strip_prefix(&format!("{artist}{sep}")) {
+                    name = rest.trim().to_string();
+                    break;
+                }
+            }
+        }
         let artists = if !artist.is_empty() {
             vec![artist]
         } else if derived.contains(" - ") {

@@ -820,6 +820,20 @@ impl picaro_utils::module::ModuleInterface for YoutubeModule {
         let out = self.run_yt_dlp(&["-J", "--no-warnings", &url])?;
         let v: Value = serde_json::from_str(&out)
             .map_err(|e| Error::Other(format!("yt-dlp JSON parse: {e}")))?;
+        // Only trust the thumbnail as album art for official "Topic" (YouTube
+        // Music) uploads, matching get_track_info. For regular videos the
+        // thumbnail is a frame from the music video, so refuse it and let the
+        // metadata fill / resolver supply real album art.
+        let uploader = v
+            .get("uploader")
+            .or_else(|| v.get("channel"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        if !uploader.ends_with(" - Topic") {
+            return Err(Error::Other(
+                "youtube: no album art for non-Topic uploads".into(),
+            ));
+        }
         // Pick the best thumbnail from the `thumbnails` array (mirrors
         // get_track_info); the top-level `thumbnail` alone is low-res.
         let cover = Self::best_thumbnail(&v);

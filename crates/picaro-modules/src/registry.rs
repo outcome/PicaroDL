@@ -24,14 +24,6 @@ pub static MODULE_INFO: Lazy<HashMap<String, ModuleInformation>> = Lazy::new(|| 
         crate::coreradio::module_information(),
     );
     m.insert(
-        "dance_music".to_string(),
-        crate::dance_music::module_information(),
-    );
-    m.insert(
-        "deezer_preview".to_string(),
-        crate::deezer_preview::module_information(),
-    );
-    m.insert(
         "ektoplazm".to_string(),
         crate::ektoplazm::module_information(),
     );
@@ -55,6 +47,10 @@ pub static MODULE_INFO: Lazy<HashMap<String, ModuleInformation>> = Lazy::new(|| 
         "grimearchive".to_string(),
         crate::grimearchive::module_information(),
     );
+    m.insert(
+        "internetarchive".to_string(),
+        crate::internetarchive::module_information(),
+    );
     m.insert("lrclib".to_string(), crate::lrclib::module_information());
     m.insert(
         "lyrics_ovh".to_string(),
@@ -64,6 +60,10 @@ pub static MODULE_INFO: Lazy<HashMap<String, ModuleInformation>> = Lazy::new(|| 
     m.insert(
         "musixmatch".to_string(),
         crate::musixmatch::module_information(),
+    );
+    m.insert(
+        "piratebay".to_string(),
+        crate::piratebay::module_information(),
     );
     m.insert(
         "punkcata".to_string(),
@@ -103,17 +103,18 @@ pub fn register_all(registry: &ModuleRegistry) -> Result<()> {
     crate::ccmixter::register_module(registry);
     crate::coreradio::register_module(registry);
     crate::dance_music::register_module(registry);
-    crate::deezer_preview::register_module(registry);
     crate::ektoplazm::register_module(registry);
     crate::ezhevika::register_module(registry);
     crate::fondsound::register_module(registry);
     crate::freemp3cloud::register_module(registry);
     crate::globaldjmix::register_module(registry);
     crate::grimearchive::register_module(registry);
+    crate::internetarchive::register_module(registry);
     crate::lrclib::register_module(registry);
     crate::lyrics_ovh::register_module(registry);
     crate::lyrist::register_module(registry);
     crate::musixmatch::register_module(registry);
+    crate::piratebay::register_module(registry);
     crate::punkcata::register_module(registry);
     crate::soulseek::register_module(registry);
     crate::soundcloud::register_module(registry);

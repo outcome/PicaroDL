@@ -110,7 +110,10 @@ async fn deezer_lookup_best(
     ];
     let compilation = [
         "greatest hits",
+        "greatest",
         "best of",
+        "the best of",
+        "very best",
         "compilation",
         "anthology",
         "collection",
@@ -119,6 +122,23 @@ async fn deezer_lookup_best(
         "essential",
         "box set",
         "soundtrack",
+        "decade",
+        "reeling",
+        "ultimate",
+        "legends",
+        "iconic",
+        "classics",
+        "number ones",
+        "no.1",
+        "no. 1",
+        "top 40",
+        "chart hits",
+        "anthems",
+        "playlist",
+        "mixtape",
+        "vol.",
+        "volume",
+        "timeless",
     ];
     let mut best: Option<(f64, Value)> = None;
     for it in arr {
@@ -146,7 +166,7 @@ async fn deezer_lookup_best(
             .unwrap_or("")
             .to_lowercase();
         if compilation.iter().any(|b| lal.contains(b)) {
-            s -= 0.4;
+            s -= 0.6;
         }
         if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
             best = Some((s, it.clone()));
@@ -307,6 +327,73 @@ async fn musicbrainz_lookup(client: &reqwest::Client, artist: &str, title: &str)
     );
     let v = get_json(client, &url).await?;
     v.get("recordings")?.as_array()?.first().cloned()
+}
+
+/// Release (album) titles that contain `song` by `artist`, per MusicBrainz.
+/// Album-type releases come first, then EPs/singles/compilations. Keyless and
+/// no sign-in; used to locate a song inside a discography without scanning it.
+pub async fn musicbrainz_releases_for_song(
+    client: &reqwest::Client,
+    artist: &str,
+    song: &str,
+) -> Vec<String> {
+    if song.trim().is_empty() {
+        return Vec::new();
+    }
+    let q = if artist.trim().is_empty() {
+        format!("recording:\"{song}\"")
+    } else {
+        format!("recording:\"{song}\" AND artist:\"{artist}\"")
+    };
+    let url = format!(
+        "https://musicbrainz.org/ws/2/recording?query={}&fmt=json&limit=10",
+        enc(&q)
+    );
+    let Some(v) = get_json(client, &url).await else {
+        return Vec::new();
+    };
+    let mut found: Vec<(bool, String)> = Vec::new();
+    if let Some(recs) = v.get("recordings").and_then(|r| r.as_array()) {
+        for rec in recs {
+            let title = rec.get("title").and_then(|t| t.as_str()).unwrap_or("");
+            if textmatch::similarity(song, title) < 0.6 {
+                continue;
+            }
+            if !artist.trim().is_empty() {
+                let ac = rec
+                    .pointer("/artist-credit/0/name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                if !ac.is_empty() && textmatch::similarity(artist, ac) < 0.5 {
+                    continue;
+                }
+            }
+            if let Some(rels) = rec.get("releases").and_then(|r| r.as_array()) {
+                for rel in rels {
+                    let Some(t) = rel.get("title").and_then(|x| x.as_str()) else {
+                        continue;
+                    };
+                    let t = t.trim();
+                    if t.is_empty() || found.iter().any(|(_, x)| x.eq_ignore_ascii_case(t)) {
+                        continue;
+                    }
+                    let is_album = rel
+                        .pointer("/release-group/primary-type")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.eq_ignore_ascii_case("album"))
+                        .unwrap_or(false);
+                    found.push((is_album, t.to_string()));
+                }
+            }
+        }
+    }
+    let mut albums: Vec<String> = found
+        .iter()
+        .filter(|(a, _)| *a)
+        .map(|(_, t)| t.clone())
+        .collect();
+    albums.extend(found.iter().filter(|(a, _)| !*a).map(|(_, t)| t.clone()));
+    albums
 }
 
 /// Fill empty `name`/`album`/`artists`/`cover_url` on `info` from keyless
@@ -478,6 +565,19 @@ pub async fn fill_track_metadata(
         }
     }
 
+    // Keep album artist in sync with the resolved artist so players group
+    // singles correctly.
+    if info.tags.album_artist.is_none() {
+        if let Some(a) = info
+            .artists
+            .iter()
+            .find(|a| !a.trim().is_empty())
+            .cloned()
+        {
+            info.tags.album_artist = Some(a);
+        }
+    }
+
     filled.sort_unstable();
     filled.dedup();
     filled
@@ -579,6 +679,17 @@ pub async fn fill_track_metadata_force(
                 info.cover_url = c;
                 filled.push("cover");
             }
+        }
+    }
+
+    if info.tags.album_artist.is_none() {
+        if let Some(a) = info
+            .artists
+            .iter()
+            .find(|a| !a.trim().is_empty())
+            .cloned()
+        {
+            info.tags.album_artist = Some(a);
         }
     }
 

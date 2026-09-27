@@ -124,6 +124,23 @@ fn find_first_audio(dir: &Path) -> Option<PathBuf> {
     first
 }
 
+/// Recursively collect every audio file under `dir` (e.g. all the tracks a
+/// single-release archive expanded into).
+fn collect_audio_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_audio_files(&path, out);
+        } else if is_audio_ext(&path) {
+            out.push(path);
+        }
+    }
+}
+
 /// Extract a zip archive into `out`, skipping traversal-unsafe entries.
 async fn extract_zip(archive: &Path, out: &Path) -> Result<()> {
     let archive = archive.to_path_buf();
@@ -313,6 +330,9 @@ impl Downloader {
             return Err(Error::Download(err.clone()));
         }
 
+        // 2a. Clean/backfill module metadata from the resolver-scored result.
+        normalize_track_metadata(&mut track_info, &data);
+
         // 2b. Backfill missing metadata from keyless sources.
         if globals.get_bool_or("metadata", "fill_misc", true) {
             let client = reqwest::Client::new();
@@ -321,9 +341,10 @@ impl Downloader {
             if !filled.is_empty() {
                 info!("metadata fill: {}", filled.join(", "));
             }
-            // Low-trust sources (YouTube uploader names / video thumbnails):
-            // replace with real artist/album/cover when confidently matched.
-            if service.eq_ignore_ascii_case("youtube") {
+            // Low-trust sources (YouTube uploader names / video thumbnails,
+            // Soulseek scene filenames): replace with the real artist/title/
+            // album/cover when confidently matched.
+            if is_low_trust_source(service) {
                 let forced = picaro_utils::metadata_fill::fill_track_metadata_force(
                     &client,
                     &mut track_info,
@@ -441,6 +462,38 @@ impl Downloader {
                 let url = download.file_url.ok_or_else(|| {
                     Error::Download("module returned URL but no file_url".to_string())
                 })?;
+                // Magnet links (torrent index providers) go through the
+                // BitTorrent engine, not the hoster resolver.
+                let torrent_bytes = 'torrent: {
+                    if !crate::torrent::is_magnet(&url) {
+                        break 'torrent None;
+                    }
+                    let settings = crate::torrent::TorrentSettings::from_globals(&globals);
+                    let dir = dest
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| self.output_path.clone());
+                    let files = crate::torrent::download_magnet(
+                        &url,
+                        &dir,
+                        &settings,
+                        Some(self.events.0.clone()),
+                        &track_info.name,
+                    )
+                    .await?;
+                    match crate::mega::pick_best_file(&files, &track_info.name) {
+                        Some(chosen) => {
+                            let chosen = chosen.to_path_buf();
+                            let len = tokio::fs::metadata(&chosen).await?.len();
+                            dest = chosen;
+                            Some(len)
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(bytes) = torrent_bytes {
+                    bytes
+                } else {
                 // Keyless MEGA public links are fetched via the `mega` crate
                 // rather than the generic hoster resolver.
                 let mega_bytes = 'mega: {
@@ -503,6 +556,7 @@ impl Downloader {
                         ),
                     )
                     .await?
+                }
                 }
             }
             DownloadSource::TempFilePath | DownloadSource::Mpd => {
@@ -757,21 +811,28 @@ impl Downloader {
             resolution,
             compression,
         };
-        let cover_info = module
-            .get_track_cover(
-                track.id.as_deref().unwrap_or(""),
-                &opts,
-                track.cover_extra_kwargs.clone().into_iter().collect(),
-            )
-            .await?;
-        if cover_info.url.is_empty() {
+        // Prefer the cover already resolved during metadata fill (e.g. Deezer);
+        // only ask the module when the track has none.
+        let (cover_url, cover_type) = if !track.cover_url.trim().is_empty() {
+            (track.cover_url.clone(), file_type)
+        } else {
+            let info = module
+                .get_track_cover(
+                    track.id.as_deref().unwrap_or(""),
+                    &opts,
+                    track.cover_extra_kwargs.clone().into_iter().collect(),
+                )
+                .await?;
+            (info.url, info.file_type)
+        };
+        if cover_url.is_empty() {
             return Err(Error::Other("empty cover url".into()));
         }
-        let temp = crate::http::create_temp_filename_with_ext(cover_info.file_type.extension());
+        let temp = crate::http::create_temp_filename_with_ext(cover_type.extension());
         let client = reqwest::Client::new();
         let _ = download_to_path(
             &client,
-            &cover_info.url,
+            &cover_url,
             &temp,
             None,
             DownloadProgress::hidden(),
@@ -804,6 +865,10 @@ impl Downloader {
         let mut succeeded = 0u32;
         let mut skipped = 0u32;
         let mut failed = 0u32;
+        // A release whose album resolves to a single download id is usually one
+        // archive holding every track (e.g. CoreRadio's per-album 7z), so keep
+        // everything it extracts rather than just the first song.
+        let single_archive = album.tracks.len() == 1;
         for track in &album.tracks {
             let id = track.id();
             // Build a per-track filename inside the album folder
@@ -814,6 +879,18 @@ impl Downloader {
             {
                 Ok(p) => {
                     succeeded += 1;
+                    if single_archive {
+                        let dir = p
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| album_path.clone());
+                        let mut found = Vec::new();
+                        collect_audio_files(&dir, &mut found);
+                        if found.len() > 1 {
+                            paths.extend(found);
+                            continue;
+                        }
+                    }
                     paths.push(p);
                 }
                 Err(Error::Download(s))
@@ -867,6 +944,16 @@ impl Downloader {
                 picaro_utils::metadata_fill::fill_track_metadata(&client, &mut track_info).await;
             if !filled.is_empty() {
                 self.log_info(format!("metadata fill: {}", filled.join(", ")));
+            }
+            if is_low_trust_source(service) {
+                let forced = picaro_utils::metadata_fill::fill_track_metadata_force(
+                    &client,
+                    &mut track_info,
+                )
+                .await;
+                if !forced.is_empty() {
+                    self.log_info(format!("metadata override: {}", forced.join(", ")));
+                }
             }
         }
         let cover_path = self
@@ -956,6 +1043,38 @@ impl Downloader {
                 let url = download.file_url.ok_or_else(|| {
                     Error::Download("module returned URL but no file_url".to_string())
                 })?;
+                // Magnet links (torrent index providers) go through the
+                // BitTorrent engine, not the hoster resolver.
+                let torrent_bytes = 'torrent: {
+                    if !crate::torrent::is_magnet(&url) {
+                        break 'torrent None;
+                    }
+                    let settings = crate::torrent::TorrentSettings::from_globals(&globals);
+                    let dir = dest
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| self.output_path.clone());
+                    let files = crate::torrent::download_magnet(
+                        &url,
+                        &dir,
+                        &settings,
+                        Some(self.events.0.clone()),
+                        &track_info.name,
+                    )
+                    .await?;
+                    match crate::mega::pick_best_file(&files, &track_info.name) {
+                        Some(chosen) => {
+                            let chosen = chosen.to_path_buf();
+                            let len = tokio::fs::metadata(&chosen).await?.len();
+                            dest = chosen;
+                            Some(len)
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(bytes) = torrent_bytes {
+                    bytes
+                } else {
                 // Keyless MEGA public links are fetched via the `mega` crate
                 // rather than the generic hoster resolver.
                 let mega_bytes = 'mega: {
@@ -1017,6 +1136,7 @@ impl Downloader {
                         ),
                     )
                     .await?
+                }
                 }
             }
             DownloadSource::TempFilePath | DownloadSource::Mpd => {
@@ -1286,6 +1406,35 @@ impl Downloader {
         Ok(all)
     }
 
+    /// Download a `magnet:` link (BitTorrent) into a `torrents/` subfolder of
+    /// the output path, returning the audio files the release produced.
+    /// Honours the `[torrent]` settings block (disabled by default).
+    pub async fn download_magnet_url(&self, magnet: &str) -> Result<Vec<PathBuf>> {
+        let globals = self.globals();
+        let settings = crate::torrent::TorrentSettings::from_globals(&globals);
+        let dir = self.output_path.join("torrents");
+        tokio::fs::create_dir_all(&dir).await?;
+        let _ = self.events.0.send(DownloadEvent::Started {
+            service: "torrent".to_string(),
+            context: "magnet".to_string(),
+        });
+        let files = crate::torrent::download_magnet(
+            magnet,
+            &dir,
+            &settings,
+            Some(self.events.0.clone()),
+            "magnet",
+        )
+        .await?;
+        let _ = self.events.0.send(DownloadEvent::Finished {
+            service: "torrent".to_string(),
+            succeeded: files.len() as u32,
+            skipped: 0,
+            failed: 0,
+        });
+        Ok(files)
+    }
+
     pub async fn search(
         &self,
         service: &str,
@@ -1311,6 +1460,88 @@ impl Downloader {
 
 /// File extension for a codec. Mirrors Python's `codec_data` container map:
 /// AC3 keeps its own container, MQA/error/unknown fall back to FLAC.
+/// Sources whose own metadata comes from a filename / uploader and is not
+/// trustworthy enough to keep (YouTube channels, Soulseek scene filenames,
+/// direct-MP3 CDN site titles).
+fn is_low_trust_source(service: &str) -> bool {
+    matches!(
+        service.to_ascii_lowercase().as_str(),
+        "youtube" | "soulseek" | "zvu4it" | "tancpol" | "freemp3cloud"
+    )
+}
+
+/// Clean up module-supplied track metadata before it is filled/tagged:
+/// backfill anything the resolver knows (it scored the match) and drop
+/// filename noise like an "Artist - " prefix or a trailing "(FLAC)".
+fn normalize_track_metadata(
+    info: &mut TrackInfo,
+    data: &std::collections::HashMap<String, serde_json::Value>,
+) {
+    if info.name.trim().is_empty() {
+        if let Some(n) = data.get("__track_name__").and_then(|v| v.as_str()) {
+            if !n.trim().is_empty() {
+                info.name = n.to_string();
+            }
+        }
+    }
+    if info.artists.iter().all(|a| a.trim().is_empty()) {
+        if let Some(a) = data.get("__artist__").and_then(|v| v.as_str()) {
+            if !a.trim().is_empty() {
+                info.artists = vec![a.to_string()];
+            }
+        }
+    }
+    if info.album.trim().is_empty() {
+        if let Some(al) = data.get("__album__").and_then(|v| v.as_str()) {
+            if !al.trim().is_empty() {
+                info.album = al.to_string();
+            }
+        }
+    }
+    if info.cover_url.trim().is_empty() {
+        if let Some(c) = data.get("__cover__").and_then(|v| v.as_str()) {
+            if !c.trim().is_empty() {
+                info.cover_url = c.to_string();
+            }
+        }
+    }
+
+    let mut name = info.name.trim().to_string();
+    for suffix in [
+        " (FLAC)",
+        " (flac)",
+        " (MP3)",
+        " (mp3)",
+        " (320)",
+        " (320kbps)",
+        " (HQ)",
+        " (Lossless)",
+    ] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            name = stripped.trim().to_string();
+            break;
+        }
+    }
+    // `<artist> - <title>` where the artist is already a separate field.
+    if let Some(a) = info
+        .artists
+        .iter()
+        .find(|a| !a.trim().is_empty())
+        .map(|a| a.trim().to_string())
+    {
+        for sep in [" - ", " · ", " – ", " — ", " | "] {
+            if let Some(rest) = name.strip_prefix(&format!("{a}{sep}")) {
+                let rest = rest.trim();
+                if !rest.is_empty() {
+                    name = rest.to_string();
+                }
+                break;
+            }
+        }
+    }
+    info.name = name;
+}
+
 fn extension_for_codec(codec: CodecFlags) -> &'static str {
     match codec.pretty().to_lowercase().as_str() {
         "flac" => "flac",

@@ -47,9 +47,9 @@ pub struct Resolver {
     picaro: Arc<Picaro>,
     scores: HashMap<String, f64>,
     scores_path: PathBuf,
-    timeout: Duration,
-    timeout_lossless: Duration,
-    max_parallel: usize,
+ timeout: Duration,
+ timeout_lossless: Duration,
+ max_parallel: usize,
     min_match: f64,
     allow_mixed_sources: bool,
     allow_mixed_quality: bool,
@@ -67,8 +67,8 @@ impl Resolver {
         let timeout_lossless = Duration::from_secs(
             g.get_int_or("resolver", "probe_timeout_lossless_secs", 14)
                 .clamp(1, 60) as u64,
-        );
-        let max_parallel = g.get_int_or("resolver", "max_parallel", 6).clamp(1, 32) as usize;
+ );
+ let max_parallel = g.get_int_or("resolver", "max_parallel", 6).clamp(1, 32) as usize;
         let min_match = g
             .get("resolver", "min_match")
             .and_then(|v| v.as_f64())
@@ -110,9 +110,9 @@ impl Resolver {
             picaro,
             scores,
             scores_path,
-            timeout,
-            timeout_lossless,
-            max_parallel,
+ timeout,
+ timeout_lossless,
+ max_parallel,
             min_match,
             allow_mixed_sources,
             allow_mixed_quality,
@@ -148,35 +148,6 @@ impl Resolver {
                 "iplusfree",
                 "mp3db",
                 "ezhevika",
-                "butterboy",
-                "punkcata",
-                "primitiveofferings",
-                "deadpulpit",
-                "soundcloud",
-                "youtube",
-                "deezerpreview",
-            ],
-            QualityTier::Medium => vec![
-                "zvu4it",
-                "tancpol",
-                "ezhevika",
-                "iplusfree",
-                "mp3db",
-                "ccmixter",
-                "butterboy",
-                "punkcata",
-                "primitiveofferings",
-                "deadpulpit",
-                "soundcloud",
-                "youtube",
-            ],
-            QualityTier::Low => vec![
-                "zvu4it",
-                "tancpol",
-                "ezhevika",
-                "mp3db",
-                "ccmixter",
-                "iplusfree",
                 "butterboy",
                 "punkcata",
                 "primitiveofferings",
@@ -247,7 +218,22 @@ impl Resolver {
                 .map(|s| s.to_string())
                 .collect(),
         };
-        let mut out: Vec<String> = list.into_iter().filter(|s| self.registered(s)).collect();
+        let torrents_on = self
+            .picaro
+            .merged_globals
+            .get("torrent")
+            .and_then(|v| v.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut list = list;
+        if torrents_on && !list.iter().any(|s| s == "piratebay") {
+            list.push("piratebay".to_string());
+        }
+        let mut out: Vec<String> = list
+            .into_iter()
+            .filter(|s| self.registered(s))
+            .filter(|s| torrents_on || s != "piratebay")
+            .collect();
         // Deprioritise Opus-only providers so a native codec wins when the
         // source offers one; otherwise fall back to the self-tuning score.
         out.sort_by(|a, b| {
@@ -289,11 +275,11 @@ impl Resolver {
             let service = s.clone();
             let q = query.to_string();
             let picaro = self.picaro.clone();
-            let to = if tier == QualityTier::Lossless {
-                self.timeout_lossless
-            } else {
-                self.timeout
-            };
+ let to = if tier == QualityTier::Lossless {
+ self.timeout_lossless
+ } else {
+ self.timeout
+ };
             let min_match = self.min_match;
             futs.push(async move {
                 let start = Instant::now();
@@ -488,7 +474,6 @@ fn is_direct_track(service: &str) -> bool {
             | "grimearchive"
             | "globaldjmix"
             | "freemp3cloud"
-            | "deezerpreview"
             | "soulseek"
     )
 }

@@ -263,8 +263,13 @@ fn write_tags(
             tag.push_picture(pic.clone());
         }
         if let Some(secondary) = secondary {
+            // The secondary tag (e.g. ID3 alongside Vorbis) carries the same
+            // logical fields; only copy keys the primary didn't already set,
+            // otherwise every shared field ends up duplicated ("A;A").
             for item in secondary.items() {
-                tag.push(item.clone());
+                if !primary.items().any(|p| p.key() == item.key()) {
+                    tag.push(item.clone());
+                }
             }
             for pic in secondary.pictures() {
                 tag.push_picture(pic.clone());

@@ -121,6 +121,9 @@ crossbeam-channel = "0.5"
 # 7z extraction
 sevenz-rust = "0.6"
 
+# bittorrent (default off at runtime)
+librqbit = { version = "8", default-features = false, features = ["default-tls"] }
+
 # zip extraction
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 

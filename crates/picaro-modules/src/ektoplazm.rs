@@ -292,9 +292,15 @@ impl picaro_utils::module::ModuleInterface for EktoplazmModule {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| derived.clone());
+        let album = data
+            .get("__album__")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(album0);
         Ok(TrackInfo {
             name,
-            album: album0,
+            album,
             album_id: String::new(),
             artists: if artist.is_empty() {
                 vec![]

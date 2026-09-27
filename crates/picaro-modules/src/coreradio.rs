@@ -195,6 +195,138 @@ fn parse_search_results(html: &str) -> Vec<SearchResult> {
     out
 }
 
+/// Song titles from an album page's tracklist. CoreRadio renders them into a
+/// hidden `<div id="track-src">` as `<br>`-separated "N. Title" lines.
+fn parse_tracklist(html: &str) -> Vec<String> {
+    let div_re = Regex::new(r#"(?is)<div[^>]*id=["']track-src["'][^>]*>(.*?)</div>"#).unwrap();
+    let body = div_re
+        .captures(html)
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .unwrap_or_default();
+    let src: &str = if body.is_empty() { html } else { &body };
+    let line_re = Regex::new(r"(?s)\s*(\d{1,2})\s*[.)]\s*([^<]+)").unwrap();
+    let mut out = Vec::new();
+    for line in src.split("<br") {
+        let Some(cap) = line_re.captures(line) else {
+            continue;
+        };
+        let t = cap
+            .get(2)
+            .map(|m| m.as_str().trim().to_string())
+            .unwrap_or_default();
+        if t.len() >= 2
+            && t.len() <= 120
+            && t.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false)
+        {
+            out.push(t);
+        }
+    }
+    out
+}
+
+impl CoreRadioModule {
+    /// Run the DLE site search for `query`, paging until `limit` results.
+    async fn search_pages(&self, query: &str, limit: u32) -> Result<Vec<SearchResult>> {
+        let mut all = Vec::new();
+        let max_pages = ((limit as usize + 19) / 20).min(5);
+        for page in 0..max_pages {
+            let encoded = utf8_percent_encode(query, NON_ALPHANUMERIC).to_string();
+            let url = format!(
+                "https://coreradio.online/index.php?do=search&subaction=search&story={}&search_start={}&result_from={}",
+                encoded,
+                page,
+                page * 20 + 1
+            );
+            let resp = self
+                .client
+                .get(&url)
+                .header("Referer", "https://coreradio.online/")
+                .send()
+                .await
+                .map_err(|e| Error::Other(format!("coreradio search: {e}")))?;
+            if !resp.status().is_success() {
+                break;
+            }
+            let html = resp
+                .text()
+                .await
+                .map_err(|e| Error::Other(format!("coreradio search read: {e}")))?;
+            let results = parse_search_results(&html);
+            if results.is_empty() {
+                break;
+            }
+            all.extend(results);
+            if all.len() >= limit as usize {
+                break;
+            }
+        }
+        all.truncate(limit as usize);
+        Ok(all)
+    }
+
+    /// The site indexes album titles, not songs. To find a specific song we ask
+    /// MusicBrainz which release contains it, jump straight to CoreRadio's copy
+    /// of that album, and only fall back to scanning every release's tracklist
+    /// if the MusicBrainz lookup misses.
+    async fn find_album_for_song(
+        &self,
+        artist: &str,
+        song: &str,
+        limit: u32,
+    ) -> Result<Vec<SearchResult>> {
+        use picaro_utils::textmatch::similarity;
+
+        let releases = picaro_utils::metadata_fill::musicbrainz_releases_for_song(
+            &self.client,
+            artist,
+            song,
+        )
+        .await;
+
+        let albums = self.search_pages(artist, limit.max(100)).await?;
+        if albums.is_empty() {
+            return Ok(Vec::new());
+        }
+        let album_title = |r: &SearchResult| r.name.clone().unwrap_or_default();
+
+        // 1. MusicBrainz named the release; find CoreRadio's copy and confirm the
+        //    song is actually on its tracklist.
+        for rel in &releases {
+            let best = albums.iter().max_by(|a, b| {
+                similarity(rel, &album_title(a))
+                    .partial_cmp(&similarity(rel, &album_title(b)))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let Some(alb) = best else { continue };
+            if similarity(rel, &album_title(alb)) < 0.6 {
+                continue;
+            }
+            if let Ok(html) = fetch_album_page(&self.client, &alb.result_id).await {
+                if parse_tracklist(&html)
+                    .iter()
+                    .any(|t| similarity(song, t) >= 0.6)
+                {
+                    return Ok(vec![alb.clone()]);
+                }
+            }
+        }
+
+        // 2. Fallback: scan the artist's releases (uncapped) for the tracklist.
+        for alb in albums.iter() {
+            let Ok(html) = fetch_album_page(&self.client, &alb.result_id).await else {
+                continue;
+            };
+            if parse_tracklist(&html)
+                .iter()
+                .any(|t| similarity(song, t) >= 0.6)
+            {
+                return Ok(vec![alb.clone()]);
+            }
+        }
+        Ok(Vec::new())
+    }
+}
+
 #[async_trait]
 impl picaro_utils::module::ModuleInterface for CoreRadioModule {
     fn name(&self) -> &str {
@@ -234,8 +366,14 @@ impl picaro_utils::module::ModuleInterface for CoreRadioModule {
             }
             None => (String::new(), String::new(), String::new(), None),
         };
+        let name = data
+            .get("__track_name__")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("{artist} - {album} (FLAC)"));
         Ok(TrackInfo {
-            name: format!("{} - {} (FLAC)", artist, album),
+            name,
             album: album.clone(),
             album_id: String::new(),
             artists: vec![artist],
@@ -366,40 +504,20 @@ impl picaro_utils::module::ModuleInterface for CoreRadioModule {
         _track_info: Option<&TrackInfo>,
         limit: u32,
     ) -> Result<Vec<SearchResult>> {
-        let mut all = Vec::new();
-        let max_pages = ((limit as usize + 19) / 20).min(5);
-        for page in 0..max_pages {
-            let encoded = utf8_percent_encode(query, NON_ALPHANUMERIC).to_string();
-            let url = format!(
- "https://coreradio.online/index.php?do=search&subaction=search&story={}&search_start={}&result_from={}",
- encoded,
- page,
- page * 20 + 1
- );
-            let resp = self
-                .client
-                .get(&url)
-                .header("Referer", "https://coreradio.online/")
-                .send()
-                .await
-                .map_err(|e| Error::Other(format!("coreradio search: {e}")))?;
-            if !resp.status().is_success() {
-                break;
-            }
-            let html = resp
-                .text()
-                .await
-                .map_err(|e| Error::Other(format!("coreradio search read: {e}")))?;
-            let results = parse_search_results(&html);
-            if results.is_empty() {
-                break;
-            }
-            all.extend(results);
-            if all.len() >= limit as usize {
-                break;
+        let mut all = self.search_pages(query, limit).await?;
+        // CoreRadio's search indexes album titles, not song titles, so a song
+        // query ("Artist - Song") finds nothing. Locate the album whose
+        // tracklist contains the song; the downloader then downloads the release
+        // archive and extracts that individual song.
+        if all.is_empty() {
+            if let Some((artist, song)) = query.split_once(" - ") {
+                let artist = artist.trim();
+                let song = song.trim();
+                if !artist.is_empty() && !song.is_empty() {
+                    all = self.find_album_for_song(artist, song, limit).await?;
+                }
             }
         }
-        all.truncate(limit as usize);
         Ok(all)
     }
 }
