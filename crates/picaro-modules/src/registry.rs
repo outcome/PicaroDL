@@ -109,10 +109,13 @@ pub fn register(
 pub fn register_all(registry: &ModuleRegistry) -> Result<()> {
     crate::butterboy::register_module(registry);
     crate::ccmixter::register_module(registry);
+    crate::certifiedmixtapez::register_module(registry);
     crate::coreradio::register_module(registry);
     crate::dance_music::register_module(registry);
+    crate::darktorrent::register_module(registry);
     crate::ektoplazm::register_module(registry);
     crate::ezhevika::register_module(registry);
+    crate::fma::register_module(registry);
     crate::fondsound::register_module(registry);
     crate::freemp3cloud::register_module(registry);
     crate::globaldjmix::register_module(registry);
@@ -121,14 +124,21 @@ pub fn register_all(registry: &ModuleRegistry) -> Result<()> {
     crate::lrclib::register_module(registry);
     crate::lyrics_ovh::register_module(registry);
     crate::lyrist::register_module(registry);
+    crate::mixtapemonkey::register_module(registry);
     crate::musixmatch::register_module(registry);
+    crate::mp3tut::register_module(registry);
+    crate::mp3zona::register_module(registry);
     crate::onetrance::register_module(registry);
     crate::piratebay::register_module(registry);
     crate::punkcata::register_module(registry);
+    crate::relisten::register_module(registry);
     crate::soulseek::register_module(registry);
     crate::soundcloud::register_module(registry);
+    crate::sor::register_module(registry);
     crate::tancpol::register_module(registry);
     crate::technicaldeathmetal::register_module(registry);
+    crate::testpressing::register_module(registry);
+    crate::tomlehrer::register_module(registry);
     crate::youtube::register_module(registry);
     crate::zvu4it::register_module(registry);
     Ok(())

@@ -3468,6 +3468,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blowfish",
+ "bytes",
  "cbc",
  "chrono",
  "cipher",

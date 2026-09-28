@@ -63,11 +63,44 @@ struct Mod {
 }
 
 fn title_from_slug(slug: &str) -> String {
-    slug.trim_end_matches("-int")
-        .replace('-', " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    clean_title(
+        &slug
+            .trim_end_matches("-int")
+            .replace('-', " "),
+    )
+}
+
+/// Strip trailing scene/quality markers ("SINGLE WEB FLAC 2026 SCMT INT").
+/// This site is 100% scene releases, so the cleaner is aggressive: trailing
+/// years, format markers, all-caps/lowercase group tags (up to 4), and long
+/// digit runs (UPCs) all go. Keeps at least 2 words.
+fn clean_title(t: &str) -> String {
+    let digit_run = |s: &str| s.len() >= 5 && s.chars().all(|c| c.is_ascii_digit());
+    let mut tokens: Vec<String> = t.split_whitespace().map(|s| s.to_string()).collect();
+    tokens.retain(|tok| !digit_run(tok));
+    let mut pops = 0;
+    while tokens.len() > 2 && pops < 4 {
+        let last = tokens.last().unwrap();
+        let low = last.to_ascii_lowercase();
+        let is_year = last.len() == 4 && last.chars().all(|c| c.is_ascii_digit());
+        let is_marker = matches!(
+            low.as_str(),
+            "single" | "web" | "flac" | "mp3" | "ep" | "cdm" | "cd" | "int" | "vbr"
+                | "24bit" | "16bit" | "320" | "vinyl" | "remastered"
+        );
+        let is_tag = last.len() >= 2
+            && last.len() <= 8
+            && last
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_lowercase());
+        if is_year || is_marker || is_tag {
+            tokens.pop();
+            pops += 1;
+        } else {
+            break;
+        }
+    }
+    tokens.join(" ")
 }
 
 async fn fetch_page(client: &reqwest::Client, url: &str) -> Result<String> {
@@ -84,25 +117,59 @@ async fn fetch_page(client: &reqwest::Client, url: &str) -> Result<String> {
         .map_err(|e| Error::Other(format!("onetrance read: {e}")))
 }
 
-fn parse_node_links(html: &str) -> Vec<String> {
-    let re = Regex::new(r#"href="(/node/\d+/[^"]+)""#).unwrap();
-    let mut out = Vec::new();
+fn parse_node_links(html: &str) -> Vec<(String, String)> {
+    // /search/node anchors: link text is the release title. Label `<td>`
+    // links (no year in the slug) are dropped.
+    let re = Regex::new(
+        r#"<a[^>]*href="((?:https://1trance\.org)?/node/\d+/[^"]+)"[^>]*>(.*?)</a>"#,
+    )
+    .unwrap();
+    let year = Regex::new(r"\d{4}").unwrap();
+    let mut out: Vec<(String, String)> = Vec::new();
     for cap in re.captures_iter(html) {
-        if let Some(m) = cap.get(1) {
-            let url = format!("{BASE}{}", m.as_str());
-            if !out.contains(&url) {
-                out.push(url);
-            }
+        let raw = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let url = if raw.starts_with("http") {
+            raw.to_string()
+        } else {
+            format!("{BASE}{raw}")
+        };
+        let title = cap
+            .get(2)
+            .map(|m| {
+                let t = Regex::new(r"<[^>]*>").unwrap().replace_all(m.as_str(), " ");
+                // Link text is scene-style ("Z-LEAF_-_Hidden_Temple-..."):
+                // underscores/dashes to spaces so the resolver's token
+                // overlap sees separate words.
+                let t = t.replace('_', " ").replace('-', " ");
+                decode_entities(&t.split_whitespace().collect::<Vec<_>>().join(" "))
+            })
+            .unwrap_or_default();
+        let slug = url.rsplit('/').next().unwrap_or("");
+        if !year.is_match(slug) || out.iter().any(|(u, _)| *u == url) {
+            continue;
         }
+        out.push((url, title));
     }
     out
 }
 
+fn decode_entities(s: &str) -> String {
+    let amp = format!("{}amp;", '&');
+    let quot = format!("{}quot;", '&');
+    let apos = format!("{}#039;", '&');
+    s.replace(&amp, "&")
+        .replace(&quot, "\"")
+        .replace(&apos, "'")
+        .trim()
+        .to_string()
+}
+
 /// Direct MP3 link (tune.skin) on a release page. FLAC-only releases embed
-/// only a rapidgator link and return None here.
+/// only a rapidgator link and return None here. The link appears both as
+/// `href="..."` and as `<source src="...">` (audio preview element).
 fn parse_mp3_link(html: &str) -> Option<String> {
     let re =
-        Regex::new(r#"href="(https://tune\.skin/[A-Za-z0-9]+/[^"]+\.mp3)""#).unwrap();
+        Regex::new(r#"(?:href|src)="(https://tune\.skin/[A-Za-z0-9]+/[^"]+\.mp3)""#).unwrap();
     re.captures(html)
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
@@ -115,6 +182,14 @@ fn parse_title(html: &str) -> String {
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
         .unwrap_or_default();
+    // Node <title> tags carry the site's meta description
+    // ("... | 1trance - download descargar télécharger trance music ...").
+    // Cut at the site junk; the release name is what precedes it.
+    let cut = raw
+        .find("descargar")
+        .or_else(|| raw.find("télécharger"))
+        .unwrap_or(raw.len());
+    let raw = raw[..cut].trim().to_string();
     raw.split('|')
         .next()
         .unwrap_or(&raw)
@@ -147,12 +222,13 @@ impl picaro_utils::module::ModuleInterface for Mod {
         };
         let title = parse_title(&html);
         let slug = track_id.rsplit('/').next().unwrap_or(track_id);
+        let name = if title.is_empty() {
+            title_from_slug(slug)
+        } else {
+            clean_title(&title)
+        };
         Ok(TrackInfo {
-            name: if title.is_empty() {
-                title_from_slug(slug)
-            } else {
-                title
-            },
+            name,
             codec: CodecFlags::MP3,
             id: Some(mp3),
             tags: Tags {
@@ -207,12 +283,13 @@ impl picaro_utils::module::ModuleInterface for Mod {
         };
         let title = parse_title(&html);
         let slug = album_id.rsplit('/').next().unwrap_or(album_id);
+        let name = if title.is_empty() {
+            title_from_slug(slug)
+        } else {
+            clean_title(&title)
+        };
         Ok(AlbumInfo {
-            name: if title.is_empty() {
-                title_from_slug(slug)
-            } else {
-                title
-            },
+            name,
             tracks: vec![TrackRef::Id(mp3)],
             quality: Some("MP3".to_string()),
             ..Default::default()
@@ -267,14 +344,19 @@ impl picaro_utils::module::ModuleInterface for Mod {
         _track_info: Option<&TrackInfo>,
         limit: u32,
     ) -> Result<Vec<SearchResult>> {
-        let url = format!("{BASE}/f?s={}&t=&page=1", enc(query));
+        let url = format!("{BASE}/search/node?keys={}", enc(query));
         let html = fetch_page(&self.client, &url).await?;
         let mut out = Vec::new();
-        for node in parse_node_links(&html) {
-            let slug = node.rsplit('/').next().unwrap_or("").to_string();
+        for (node, title) in parse_node_links(&html) {
+            let name = if title.is_empty() {
+                let slug = node.rsplit('/').next().unwrap_or("").to_string();
+                title_from_slug(&slug)
+            } else {
+                clean_title(&title)
+            };
             out.push(SearchResult {
                 result_id: node,
-                name: Some(title_from_slug(&slug)),
+                name: Some(name),
                 ..Default::default()
             });
         }
@@ -284,7 +366,11 @@ impl picaro_utils::module::ModuleInterface for Mod {
 }
 
 fn enc(s: &str) -> String {
-    utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
+    // Drupal's node search matches titles joined by literal dashes;
+    // spaces become dashes, and dashes stay literal (never %2D).
+    utf8_percent_encode(&s.replace(' ', "-"), NON_ALPHANUMERIC)
+        .to_string()
+        .replace("%2D", "-")
 }
 
 pub fn register_module(registry: &picaro_utils::ModuleRegistry) {

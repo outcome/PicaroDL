@@ -72,6 +72,21 @@ pub fn is_magnet(s: &str) -> bool {
     s.trim_start().starts_with("magnet:")
 }
 
+/// True when `s` is a magnet link or an http(s) URL serving .torrent
+/// metainfo (a `.torrent` extension or a DLE `do=download` attachment
+/// endpoint). Both are routed through the BitTorrent engine.
+pub fn is_torrent(s: &str) -> bool {
+    let t = s.trim_start();
+    is_magnet(t)
+        || ((t.starts_with("http://") || t.starts_with("https://"))
+            && (t.contains(".torrent") || t.contains("do=download")))
+}
+
+fn is_torrent_url(t: &str) -> bool {
+    (t.starts_with("http://") || t.starts_with("https://"))
+        && (t.contains(".torrent") || t.contains("do=download"))
+}
+
 fn is_audio_ext(path: &Path) -> bool {
     path.extension().map_or(false, |e| {
         matches!(
@@ -121,6 +136,39 @@ pub async fn download_magnet(
     }
     tokio::fs::create_dir_all(output_dir).await?;
 
+    // An http(s) .torrent URL is fetched here with a browser UA (some
+    // DLE attachment hosts 403 default clients) and fed to the engine
+    // as raw metainfo bytes instead of letting it fetch the URL itself.
+    let torrent_bytes: Option<bytes::Bytes> = if is_torrent_url(magnet.trim_start()) {
+        let client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .build()
+            .map_err(|e| Error::Download(format!("torrent: client init: {e}")))?;
+        let resp = client
+            .get(magnet)
+            .send()
+            .await
+            .map_err(|e| Error::Download(format!("torrent: .torrent fetch failed: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(Error::Download(format!(
+                "torrent: .torrent fetch HTTP {}",
+                resp.status()
+            )));
+        }
+        let b = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Download(format!("torrent: .torrent read: {e}")))?;
+        if b.first() != Some(&b'd') {
+            return Err(Error::Download(
+                "torrent: URL did not serve bencode metainfo".into(),
+            ));
+        }
+        Some(b)
+    } else {
+        None
+    };
+
  let mut opts = SessionOptions {
  disable_dht: !settings.dht,
  ..Default::default()
@@ -139,17 +187,21 @@ pub async fn download_magnet(
  // Merge in the extra tracker list so the metadata fetch doesn't
  // depend on the single tracker baked into the magnet.
  let list_trackers: Vec<String> = EXTRA_TRACKERS.iter().map(|s| s.to_string()).collect();
+ let list_add = match &torrent_bytes {
+     Some(b) => AddTorrent::from_bytes(b.clone()),
+     None => AddTorrent::from_url(magnet.to_string()),
+ };
  let list_resp = session
- .add_torrent(
- AddTorrent::from_url(magnet.to_string()),
- Some(AddTorrentOptions {
- list_only: true,
- trackers: Some(list_trackers),
- ..Default::default()
- }),
- )
- .await
- .map_err(|e| Error::Download(format!("torrent: metadata fetch failed: {e}")))?;
+  .add_torrent(
+  list_add,
+  Some(AddTorrentOptions {
+  list_only: true,
+  trackers: Some(list_trackers),
+  ..Default::default()
+  }),
+  )
+  .await
+  .map_err(|e| Error::Download(format!("torrent: metadata fetch failed: {e}")))?;
 
     let listing = match list_resp {
         AddTorrentResponse::ListOnly(l) => l,
@@ -205,18 +257,22 @@ pub async fn download_magnet(
  // params may point at a dead tracker, and we need a working peer
  // source for the real download (not just the metadata fetch).
  let add_trackers: Vec<String> = EXTRA_TRACKERS.iter().map(|s| s.to_string()).collect();
+ let real_add = match &torrent_bytes {
+     Some(b) => AddTorrent::from_bytes(b.clone()),
+     None => AddTorrent::from_url(magnet.to_string()),
+ };
  let added = session
- .add_torrent(
- AddTorrent::from_url(magnet.to_string()),
- Some(AddTorrentOptions {
- only_files: Some(audio_indices),
- overwrite: true,
- trackers: Some(add_trackers),
- ..Default::default()
- }),
- )
- .await
- .map_err(|e| Error::Download(format!("torrent: add failed: {e}")))?;
+  .add_torrent(
+  real_add,
+  Some(AddTorrentOptions {
+  only_files: Some(audio_indices),
+  overwrite: true,
+  trackers: Some(add_trackers),
+  ..Default::default()
+  }),
+  )
+  .await
+  .map_err(|e| Error::Download(format!("torrent: add failed: {e}")))?;
 
     let handle = added
         .into_handle()

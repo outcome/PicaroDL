@@ -81,10 +81,34 @@ fn parse_vk_link(html: &str) -> Option<String> {
 }
 
 fn title_from_slug(slug: &str) -> String {
-    slug.replace('-', " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    clean_title(&slug.replace('-', " "))
+}
+
+/// Strip trailing scene/quality markers so the resolver's text-overlap
+/// score isn't diluted and file/album names read clean.
+fn clean_title(t: &str) -> String {
+    let mut tokens: Vec<String> = t.split_whitespace().map(|s| s.to_string()).collect();
+    while tokens.len() > 1 {
+        let last = tokens.last().unwrap();
+        let low = last.to_ascii_lowercase();
+        let is_year = last.len() == 4 && last.chars().all(|c| c.is_ascii_digit());
+        let is_marker = matches!(
+            low.as_str(),
+            "single" | "web" | "flac" | "mp3" | "ep" | "cdm" | "cd" | "int" | "vbr"
+                | "24bit" | "16bit" | "320" | "vinyl" | "remastered"
+        );
+        let is_caps_tag = last.len() >= 2
+            && last.len() <= 8
+            && last
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+        if is_year || is_marker || is_caps_tag {
+            tokens.pop();
+        } else {
+            break;
+        }
+    }
+    tokens.join(" ")
 }
 
 fn parse_title(html: &str) -> String {

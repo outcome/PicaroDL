@@ -136,6 +136,8 @@ impl Resolver {
                 "ektoplazm",
                 "coreradio",
                 "alterportal",
+                "technicaldeathmetal",
+                "relisten",
             ],
             QualityTier::High => vec![
                 "soulseek",
@@ -152,6 +154,16 @@ impl Resolver {
                 "punkcata",
                 "primitiveofferings",
                 "deadpulpit",
+                "fma",
+                "tomlehrer",
+                "testpressing",
+                "mp3zona",
+                "mp3tut",
+                "onetrance",
+                "systemsofromance",
+                "relisten",
+                "mixtapemonkey",
+                "certifiedmixtapez",
                 "soundcloud",
                 "youtube",
             ],
@@ -168,6 +180,15 @@ impl Resolver {
                 "ezhevika",
                 "primitiveofferings",
                 "deadpulpit",
+                "fma",
+                "tomlehrer",
+                "testpressing",
+                "mp3zona",
+                "mp3tut",
+                "systemsofromance",
+                "relisten",
+                "mixtapemonkey",
+                "certifiedmixtapez",
             ],
             QualityTier::Low => vec![
                 "youtube",
@@ -226,13 +247,15 @@ impl Resolver {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let mut list = list;
-        if torrents_on && !list.iter().any(|s| s == "piratebay") {
-            list.push("piratebay".to_string());
+        for torrent_module in ["piratebay", "darktorrent"] {
+            if torrents_on && !list.iter().any(|s| s == torrent_module) {
+                list.push(torrent_module.to_string());
+            }
         }
         let mut out: Vec<String> = list
             .into_iter()
             .filter(|s| self.registered(s))
-            .filter(|s| torrents_on || s != "piratebay")
+            .filter(|s| torrents_on || (s != "piratebay" && s != "darktorrent"))
             .collect();
         // Deprioritise Opus-only providers so a native codec wins when the
         // source offers one; otherwise fall back to the self-tuning score.
@@ -475,6 +498,11 @@ fn is_direct_track(service: &str) -> bool {
             | "globaldjmix"
             | "freemp3cloud"
             | "onetrance"
+            | "fma"
+            | "tomlehrer"
+            | "testpressing"
+            | "mp3zona"
+            | "mp3tut"
             | "soulseek"
     )
 }
@@ -500,9 +528,16 @@ fn score_result(query: &str, r: &SearchResult) -> f64 {
     let s_title = textmatch::similarity(&qt, name);
     match &qa {
         Some(a) => {
-            let a_match =
-                textmatch::similarity(a, &artists).max(textmatch::similarity(a, &combined));
-            0.5 * a_match + 0.5 * s_full.max(s_title)
+            if artists.trim().is_empty() {
+                // Result carries no artist metadata: score by requiring the
+                // FULL query (artist + title tokens) to overlap the result
+                // name, so a same-title/different-artist hit still scores low.
+                s_full
+            } else {
+                let a_match =
+                    textmatch::similarity(a, &artists).max(textmatch::similarity(a, &combined));
+                0.5 * a_match + 0.5 * s_full.max(s_title)
+            }
         }
         // No explicit artist: accept if the query matches the artist, the
         // title, or the combined string well.

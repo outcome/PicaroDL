@@ -54,6 +54,33 @@ pub fn config_dir() -> PathBuf {
     PathBuf::from("config")
 }
 
+/// Project root: the directory containing `config/` when deployed next to
+/// the binary, else the binary's own directory, else CWD. Relative download
+/// paths anchor here, so running the binary from an arbitrary directory
+/// never scatters downloads across whatever CWD happened to be current.
+pub fn project_root() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            if parent.join("config").is_dir() {
+                return parent.to_path_buf();
+            }
+        }
+    }
+    // Dev layout: config/ is at the CWD (project root), the exe is in
+    // target/debug. Check CWD before falling back to the exe dir.
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.join("config").is_dir() {
+            return cwd;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    PathBuf::from(".")
+}
+
 /// Each module folder has a `module.json` that mirrors `module_information`
 /// in the original Python. We use that file to discover the module's name,
 /// supported modes, and default settings - so users can drop in/out modules

@@ -465,7 +465,7 @@ impl Downloader {
                 // Magnet links (torrent index providers) go through the
                 // BitTorrent engine, not the hoster resolver.
                 let torrent_bytes = 'torrent: {
-                    if !crate::torrent::is_magnet(&url) {
+                    if !crate::torrent::is_torrent(&url) {
                         break 'torrent None;
                     }
                     let settings = crate::torrent::TorrentSettings::from_globals(&globals);
@@ -1057,7 +1057,7 @@ impl Downloader {
                 // Magnet links (torrent index providers) go through the
                 // BitTorrent engine, not the hoster resolver.
                 let torrent_bytes = 'torrent: {
-                    if !crate::torrent::is_magnet(&url) {
+                    if !crate::torrent::is_torrent(&url) {
                         break 'torrent None;
                     }
                     let settings = crate::torrent::TorrentSettings::from_globals(&globals);

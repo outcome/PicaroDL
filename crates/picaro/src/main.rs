@@ -333,7 +333,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             })?;
             let mut resolver = picaro_downloader::resolver::Resolver::new(
                 picaro.clone(),
-                PathBuf::from("cache/providers.json"),
+                picaro_core::loader::config_dir().join("providers.json"),
             );
             resolver.set_only(only);
             if resolve_only {
@@ -471,22 +471,35 @@ fn fmt_of(name: &str) -> &'static str {
 }
 
 fn make_downloader(picaro: Arc<Picaro>, cli: &Cli) -> Arc<Downloader> {
-    let download_path = cli
-        .download_path
-        .clone()
-        .or_else(|| {
-            picaro
-                .merged_globals
-                .get("general")
-                .and_then(|v| v.get("download_path"))
-                .and_then(|v| v.as_str())
-                .map(|s| PathBuf::from(s))
-        })
-        .unwrap_or_else(|| PathBuf::from("./downloads"));
-    std::fs::create_dir_all(&download_path).ok();
-    let downloader = Arc::new(Downloader::new(picaro, download_path));
-    spawn_progress_printer(&downloader);
-    downloader
+ let raw = cli
+ .download_path
+ .clone()
+ .or_else(|| {
+ picaro
+ .merged_globals
+ .get("general")
+ .and_then(|v| v.get("download_path"))
+ .and_then(|v| v.as_str())
+ .map(|s| PathBuf::from(s))
+ })
+ .unwrap_or_else(|| PathBuf::from("./downloads"));
+ // A relative download_path used to resolve against the process CWD, so
+ // running the binary from anywhere scattered downloads across whatever
+ // directory you happened to be in. Anchor relative paths to the project
+ // root (config/ sits inside it) instead.
+ let download_path = if raw.is_absolute() {
+ raw
+ } else {
+ let root = picaro_core::loader::project_root()
+ .parent()
+ .map(|p| p.to_path_buf())
+ .unwrap_or_else(|| PathBuf::from("."));
+ root.join(raw)
+ };
+ std::fs::create_dir_all(&download_path).ok();
+ let downloader = Arc::new(Downloader::new(picaro, download_path));
+ spawn_progress_printer(&downloader);
+ downloader
 }
 
 /// Print download events as one parseable line each on stdout, so a host

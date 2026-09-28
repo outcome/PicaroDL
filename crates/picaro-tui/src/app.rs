@@ -309,6 +309,19 @@ pub async fn run(picaro: Arc<Picaro>) -> std::io::Result<()> {
         download_path
     };
     let download_path = std::path::PathBuf::from(download_path);
+    // A relative download_path used to resolve against the process CWD,
+    // scattering downloads across whatever directory the binary was started
+    // from. Anchor relative paths to the project root (config/ sits inside
+    // it) instead.
+    let download_path = if download_path.is_absolute() {
+        download_path
+    } else {
+        let root = picaro_core::loader::project_root()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        root.join(download_path)
+    };
     std::fs::create_dir_all(&download_path).ok();
     let downloader = Arc::new(Downloader::new(picaro.clone(), download_path));
     let mut app = App::new(picaro.clone(), downloader.clone());
