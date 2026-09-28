@@ -474,6 +474,7 @@ fn is_direct_track(service: &str) -> bool {
             | "grimearchive"
             | "globaldjmix"
             | "freemp3cloud"
+            | "onetrance"
             | "soulseek"
     )
 }

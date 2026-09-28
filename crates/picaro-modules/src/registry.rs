@@ -62,6 +62,10 @@ pub static MODULE_INFO: Lazy<HashMap<String, ModuleInformation>> = Lazy::new(|| 
         crate::musixmatch::module_information(),
     );
     m.insert(
+        "onetrance".to_string(),
+        crate::onetrance::module_information(),
+    );
+    m.insert(
         "piratebay".to_string(),
         crate::piratebay::module_information(),
     );
@@ -78,6 +82,10 @@ pub static MODULE_INFO: Lazy<HashMap<String, ModuleInformation>> = Lazy::new(|| 
         crate::soundcloud::module_information(),
     );
     m.insert("tancpol".to_string(), crate::tancpol::module_information());
+    m.insert(
+        "technicaldeathmetal".to_string(),
+        crate::technicaldeathmetal::module_information(),
+    );
     m.insert("youtube".to_string(), crate::youtube::module_information());
     m.insert("zvu4it".to_string(), crate::zvu4it::module_information());
     m
@@ -114,11 +122,13 @@ pub fn register_all(registry: &ModuleRegistry) -> Result<()> {
     crate::lyrics_ovh::register_module(registry);
     crate::lyrist::register_module(registry);
     crate::musixmatch::register_module(registry);
+    crate::onetrance::register_module(registry);
     crate::piratebay::register_module(registry);
     crate::punkcata::register_module(registry);
     crate::soulseek::register_module(registry);
     crate::soundcloud::register_module(registry);
     crate::tancpol::register_module(registry);
+    crate::technicaldeathmetal::register_module(registry);
     crate::youtube::register_module(registry);
     crate::zvu4it::register_module(registry);
     Ok(())
