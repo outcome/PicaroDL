@@ -558,7 +558,7 @@ impl Resolver {
                 .attempt(downloader, query, service, r, QualityTier::Lossless, tier)
                 .await
             {
-                Ok(p) => return Ok(self.finish(service, query, tier, p)),
+                Ok(p) => return Ok(self.finish(service, query, p)),
                 Err(e) => {
                     self.record(service, 5.0, false);
                     warn!("resolver: {} matched '{}' but failed: {}", service, query, e);
@@ -609,7 +609,7 @@ impl Resolver {
             }
             p2p_tries += 1;
             match self.attempt(downloader, query, service, r, tier, tier).await {
-                Ok(p) => return Ok(self.finish(service, query, tier, p)),
+                Ok(p) => return Ok(self.finish(service, query, p)),
                 Err(e) => {
                     self.record(service, 5.0, false);
                     warn!("resolver: {} matched '{}' but failed: {}", service, query, e);
@@ -636,7 +636,7 @@ impl Resolver {
                 .attempt(downloader, query, &service, &r, expected_direct, tier)
                 .await
             {
-                Ok(p) => return Ok(self.finish(&service, query, tier, p)),
+                Ok(p) => return Ok(self.finish(&service, query, p)),
                 Err(e) => {
                     self.record(&service, 5.0, false);
                     warn!("resolver: {} matched '{}' but failed: {}", service, query, e);
@@ -651,11 +651,19 @@ impl Resolver {
             .collect::<Vec<(String, f64, SearchResult)>>();
         g_opus.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         for (service, _, r) in g_opus {
+            // Opus streams are the last-resort tier; quality-check them
+            // laxly (a lossless request accepting an opus fallback is
+            // the designed behavior, not a guard violation).
+            let expected = if tier == QualityTier::Lossless {
+                QualityTier::High
+            } else {
+                tier
+            };
             match self
-                .attempt(downloader, query, &service, &r, tier, tier)
+                .attempt(downloader, query, &service, &r, expected, tier)
                 .await
             {
-                Ok(p) => return Ok(self.finish(&service, query, tier, p)),
+                Ok(p) => return Ok(self.finish(&service, query, p)),
                 Err(e) => {
                     self.record(&service, 5.0, false);
                     warn!("resolver: {} matched '{}' but failed: {}", service, query, e);
@@ -732,10 +740,16 @@ impl Resolver {
         Ok(p)
     }
 
-    fn finish(&mut self, service: &str, query: &str, tier: QualityTier, p: PathBuf) -> PathBuf {
+    fn finish(&mut self, service: &str, query: &str, p: PathBuf) -> PathBuf {
         self.record(service, 0.5, true);
         save_scores(&self.scores_path, &self.scores);
-        info!("resolver: '{}' -> {} [{}]", query, service, tier.as_str());
+        // Report what actually landed on disk, not what was requested.
+        let delivered = if quality_ok(&p, QualityTier::Lossless) {
+            "lossless"
+        } else {
+            "lossy"
+        };
+        info!("resolver: '{}' -> {} [{}]", query, service, delivered);
         p
     }
 }

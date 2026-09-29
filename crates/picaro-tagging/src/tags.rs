@@ -240,6 +240,12 @@ fn write_tags(
     secondary: Option<&Tag>,
     image_path: Option<&Path>,
 ) -> Result<()> {
+    // Strip a trailing ID3v1 block BEFORE parsing: lofty keeps whatever
+    // v1 tag it reads in memory and re-writes it on save, and its
+    // 30-byte title truncation panics on multi-byte characters ('ä').
+    // ID3v2.4 (written below) holds the full Unicode metadata anyway,
+    // so the v1 block is pure legacy.
+    let _ = strip_id3v1(path);
     let mut tagged_file =
         lofty::read_from_path(path).map_err(|e| Error::TagSavingFailure(format!("read: {e}")))?;
     if let Some(tag) = tagged_file.primary_tag_mut() {
@@ -295,6 +301,26 @@ fn write_tags(
         .save_to_path(path, WriteOptions::default())
         .map_err(|e| Error::TagSavingFailure(format!("save: {e}")))?;
     Ok(())
+}
+
+/// Remove the legacy 128-byte ID3v1 trailer (last bytes "TAG...") from
+/// `path`, if present. Returns whether a block was removed.
+fn strip_id3v1(path: &Path) -> std::io::Result<bool> {
+    let f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let len = f.metadata()?.len();
+    if len < 128 {
+        return Ok(false);
+    }
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = f;
+    f.seek(SeekFrom::Start(len - 128))?;
+    let mut magic = [0u8; 3];
+    f.read_exact(&mut magic)?;
+    if &magic != b"TAG" {
+        return Ok(false);
+    }
+    f.set_len(len - 128)?;
+    Ok(true)
 }
 
 /// Resize an image if it exceeds the limit, mirroring
