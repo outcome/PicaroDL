@@ -300,6 +300,41 @@ want them, a WebView can solve the challenge once and hand the cookie to
 PicaroDL through the `PICARO_CF_COOKIE` environment variable; `PICARO_FLARESOLVERR`
 can point at an optional remote solver. Neither is required.
 
+### Cloudflare-gated sources (optional webview solver)
+
+Roughly 15 FLAC sites we tested are otherwise perfect — direct downloads,
+regex-friendly — but sit behind Cloudflare's JS challenge. Building with
+
+```bash
+cargo build --release --features webview
+```
+
+adds a built-in solver: the first time a fetch hits a challenge, PicaroDL
+drives your system Chromium (Brave/Chrome/Edge, whichever it finds; override
+with `PICARO_BROWSER`) in a **real browser window parked off-screen** —
+headless is fingerprinted and never clears — harvests the `cf_clearance`
+cookie, persists it to `config/cf-cookies.json`, and every later fetch is
+plain `reqwest` with no browser involved. Verified: flacmania.biz cleared in
+22s, then fetched at HTTP 200 with plain curl. A standalone helper does the
+same from scripts:
+
+```bash
+./target/release/picaro-cf-solve https://flacmania.biz/ --save config/cf-cookies.json
+```
+
+Platform support for gated sources:
+
+| Platform | Path |
+|---|---|
+| Windows / Linux desktop | built-in solver (`--features webview`) |
+| Android (CLI) | copy a solved `config/cf-cookies.json` from your PC |
+| Switch homebrew | no webview exists — copy `cf-cookies.json`, or point `PICARO_FLARESOLVERR` at a solver on your LAN (plain HTTP) |
+
+Knobs: `PICARO_BROWSER` (executable path), `PICARO_CF_HEADLESS` (force
+headless — will likely fail the challenge), `PICARO_NO_WEBVIEW` (disable
+auto-solving), `PICARO_CF_COOKIES` (cookie store path),
+`PICARO_CF_SOLVE_TIMEOUT` (seconds, default 60).
+
 ## Disclaimer
 
 PicaroDL hosts nothing and does not defeat authentication. It's meant for
