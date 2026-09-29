@@ -47,6 +47,10 @@ pub struct Resolver {
     picaro: Arc<Picaro>,
     scores: HashMap<String, f64>,
     scores_path: PathBuf,
+    /// Rolling P2P transfer health (speed strikes + benching), persisted
+    /// next to the scores so slow/dead P2P services get skipped outright.
+    health: HashMap<String, P2PHealth>,
+    health_path: PathBuf,
  timeout: Duration,
  timeout_lossless: Duration,
  max_parallel: usize,
@@ -55,6 +59,17 @@ pub struct Resolver {
     allow_mixed_quality: bool,
     allow: Option<Vec<String>>,
     tier_order: HashMap<QualityTier, Vec<String>>,
+}
+
+/// Speed/failure history for one P2P service.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct P2PHealth {
+    strikes: u32,
+    benched: bool,
+    last_speed_kbps: f64,
+    /// Resolves passed since the service was benched; a probe is allowed
+    /// every `p2p.probe_interval` resolves.
+    since_probe: u32,
 }
 
 impl Resolver {
@@ -106,10 +121,17 @@ impl Resolver {
             })
             .unwrap_or_default();
         let scores = load_scores(&scores_path);
+        let health_path = scores_path.with_file_name("p2p-health.json");
+        let health = std::fs::read_to_string(&health_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
         Self {
             picaro,
             scores,
             scores_path,
+            health,
+            health_path,
  timeout,
  timeout_lossless,
  max_parallel,
@@ -488,6 +510,16 @@ impl Resolver {
         if tier != QualityTier::Lossless {
             services.retain(|s| !lossless_src(s));
         }
+        // Bench the slow: a P2P service with a recent record of slow or
+        // failed transfers sits the whole resolve out (its search, too -
+        // Soulseek's 15s window is the fixed cost we most want to skip),
+        // until its probe interval comes due.
+        let g = GlobalSettings::from_merged(&self.picaro.merged_globals);
+        let probe_interval = g.get_int_or("p2p", "probe_interval", 10).max(1) as u32;
+        let min_speed_kbps =
+            g.get("p2p", "min_speed_kbps").and_then(|v| v.as_f64()).unwrap_or(128.0);
+        let slow_strikes = g.get_int_or("p2p", "slow_strikes", 3).max(1) as u32;
+        services.retain(|s| !is_p2p(s) || self.p2p_allowed_in_wave(s, probe_interval));
         services.dedup();
         if services.is_empty() {
             return Err(Error::Other(format!("resolver: no source has '{query}'")));
@@ -617,6 +649,7 @@ impl Resolver {
                 break; // not enough left to be worth starting
             }
             p2p_tries += 1;
+            let t0 = Instant::now();
             let attempt_fut = self.attempt(downloader, query, service, r, tier, tier);
             let outcome = match tokio::time::timeout(remaining, attempt_fut).await {
                 Ok(res) => res,
@@ -628,8 +661,21 @@ impl Resolver {
                 }
             };
             match outcome {
-                Ok(p) => return Ok(self.finish(service, query, p)),
+                Ok(p) => {
+                    // Measure the delivered transfer speed: sustained
+                    // slowness benches the service (settings: p2p.*).
+                    let dt = t0.elapsed().as_secs_f64().max(0.1);
+                    let kb = tokio::fs::metadata(&p)
+                        .await
+                        .map(|m| m.len() as f64)
+                        .unwrap_or(0.0)
+                        / 1024.0;
+                    let speed = kb / dt;
+                    self.p2p_report(service, true, speed, min_speed_kbps, slow_strikes);
+                    return Ok(self.finish(service, query, p));
+                }
                 Err(e) => {
+                    self.p2p_report(service, false, 0.0, min_speed_kbps, slow_strikes);
                     self.record(service, 5.0, false);
                     warn!("resolver: {} matched '{}' but failed: {}", service, query, e);
                     last_err = Some(e);
@@ -770,6 +816,67 @@ impl Resolver {
         };
         info!("resolver: '{}' -> {} [{}]", query, service, delivered);
         p
+    }
+
+    fn save_health(&self) {
+        if let Ok(s) = serde_json::to_string_pretty(&self.health) {
+            let _ = std::fs::write(&self.health_path, s);
+        }
+    }
+
+    /// May this P2P service join the search wave? Benched services sit
+    /// out until `p2p.probe_interval` resolves pass, then rejoin for one
+    /// probe attempt.
+    fn p2p_allowed_in_wave(&mut self, service: &str, probe_interval: u32) -> bool {
+        let h = self.health.entry(service.to_string()).or_default();
+        if !h.benched {
+            return true;
+        }
+        h.since_probe += 1;
+        if h.since_probe >= probe_interval {
+            h.since_probe = 0;
+            info!("resolver: {service} benched for slowness - probe attempt");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record a P2P attempt outcome: successes below `min_speed_kbps` and
+    /// failures count as strikes; `slow_strikes` in a row benches the
+    /// service.
+    fn p2p_report(
+        &mut self,
+        service: &str,
+        ok: bool,
+        speed_kbps: f64,
+        min_speed_kbps: f64,
+        slow_strikes: u32,
+    ) {
+        let h = self.health.entry(service.to_string()).or_default();
+        if ok {
+            h.last_speed_kbps = speed_kbps;
+            if speed_kbps >= min_speed_kbps {
+                if h.benched {
+                    info!("resolver: {service} unbenched (delivered at {speed_kbps:.0} kbps)");
+                }
+                h.strikes = 0;
+                h.benched = false;
+                self.save_health();
+                return;
+            }
+        }
+        h.strikes += 1;
+        if h.strikes >= slow_strikes && !h.benched {
+            h.benched = true;
+            h.since_probe = 0;
+            warn!(
+                "resolver: benching {service} - consistently slow/failing P2P \
+                 (last speed {:.0} kbps, min {min_speed_kbps:.0}); skipping it for now",
+                h.last_speed_kbps
+            );
+        }
+        self.save_health();
     }
 }
 

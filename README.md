@@ -214,6 +214,9 @@ of the box.
 | `resolver.probe_timeout_secs` | `4` | per-source search budget (Soulseek gets ≥25s automatically) |
 | `resolver.download_timeout_secs` | `360` | hard cap on any single download attempt |
 | `p2p.enabled` | `true` | Soulseek peer-to-peer (set `false` or `PICARO_ENABLE_P2P=0` to opt out) |
+| `p2p.min_speed_kbps` | `128` | a P2P transfer averaging below this counts as a strike |
+| `p2p.slow_strikes` | `3` | strikes in a row benches the service (skipped, including its search) |
+| `p2p.probe_interval` | `10` | resolves between probe attempts for a benched service |
 | `torrent.enabled` | `false` | BitTorrent downloads (PirateBay magnets, DarkTorrent `.torrent`s); opt in to allow P2P torrent traffic |
 | `torrent.min_seeders` | `5` | torrents below this seeder count are never picked |
 | `torrent.max_size_gb` | `8` | refuse oversized releases (the selected file, for song requests) |
@@ -228,8 +231,17 @@ Soulseek gives near-universal coverage (FLAC included) with no account — the
 login is generated and stored locally on first use, and regenerated
 automatically if the network ever rejects it. It is **enabled by default**, but
 always tried **after** direct sources: its search runs on a ≥25s window (P2P
-takes longer than HTTP) and a transfer that goes nowhere is capped at 240s
-(`PICARO_SOULSEEK_DOWNLOAD_TIMEOUT`) before the chain moves on.
+takes longer than HTTP) and the whole P2P phase lives under one hard 120s
+budget.
+
+**Self-benching:** every P2P transfer is timed. One averaging under
+`p2p.min_speed_kbps` (or failing outright) counts as a strike;
+`p2p.slow_strikes` strikes in a row **benches** the service — it's skipped
+entirely, search included, so resolves stay as fast as the direct pool —
+until `p2p.probe_interval` resolves pass and it gets one probe attempt to
+redeem itself. State persists in `config/p2p-health.json`. Benchmarks: the
+same song that took 142.6s through a stalling peer resolved in **9.9s** with
+the slow service benched.
 
 ### BitTorrent / torrents
 
