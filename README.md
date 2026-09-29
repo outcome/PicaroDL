@@ -172,6 +172,8 @@ cargo build --release
 
 # download a track, letting it choose the best source and quality to fall back to
 ./target/release/picaro get "Radiohead - Creep" --quality high
+# download a whole album
+./target/release/picaro get "Shapeshifter" -t album --quality lossless --only coreradio
 
 # see which source would win, without downloading
 ./target/release/picaro get "Radiohead - Creep" --quality lossless --resolve-only

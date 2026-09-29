@@ -98,6 +98,9 @@ enum Command {
         /// Target quality: lossless|high|medium|low.
         #[arg(short, long, default_value = "high")]
         quality: String,
+        /// Download a whole album instead of one track.
+        #[arg(short = 't', long, default_value = "track")]
+        kind: String,
         /// Only resolve (print the winning source) without downloading.
         #[arg(long)]
         resolve_only: bool,
@@ -330,6 +333,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Command::Get {
             query,
             quality,
+            kind,
             resolve_only,
             only,
         } => {
@@ -341,7 +345,21 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 picaro_core::loader::config_dir().join("providers.json"),
             );
             resolver.set_only(only);
-            if resolve_only {
+            if kind == "album" && !resolve_only {
+                // Whole-album download: resolve the best matching release,
+                // then fetch every track from it.
+                let downloader = make_downloader(picaro.clone(), &cli);
+                let r = resolver.resolve(&query, tier).await?;
+                println!(
+                    "album: {} [{}]",
+                    r.service,
+                    r.result_id.split('#').next().unwrap_or(&r.result_id)
+                );
+                let files = downloader.download_album(&r.service, &r.result_id).await?;
+                for f in files {
+                    println!("Downloaded: {}", f.display());
+                }
+            } else if resolve_only {
                 match resolver.resolve(&query, tier).await {
                     Ok(r) => println!("{} [{}] -> {}", r.service, r.tier.as_str(), r.result_id),
                     Err(e) => println!("MISS: {e}"),
