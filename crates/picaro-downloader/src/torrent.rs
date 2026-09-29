@@ -209,9 +209,9 @@ pub async fn download_magnet(
      None => AddTorrent::from_url(magnet.to_string()),
  };
  let list_resp = tokio::time::timeout(
-     // For magnets this step fetches metadata from peers; with a dead
-     // swarm it would hang forever. 60s is plenty for a healthy one.
-     Duration::from_secs(60),
+     // For magnets this step fetches metadata from peers; a seeded
+     // swarm answers in seconds, a dead one never does. 30s is plenty.
+     Duration::from_secs(30),
      session.add_torrent(
      list_add,
      Some(AddTorrentOptions {
@@ -222,7 +222,7 @@ pub async fn download_magnet(
      ),
  )
  .await
- .map_err(|_| Error::Download("torrent: metadata fetch timed out (no peers answered in 60s)".into()))?
+ .map_err(|_| Error::Download("torrent: metadata fetch timed out (no peers answered in 30s)".into()))?
  .map_err(|e| Error::Download(format!("torrent: metadata fetch failed: {e}")))?;
 
     let listing = match list_resp {

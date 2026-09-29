@@ -598,17 +598,36 @@ impl Resolver {
                 .cmp(&seeders(&a.2))
                 .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
         });
-        let phase = Instant::now();
+        // P2P contract, verbatim: "check for song, if seeded, download.
+        // If it's absurdly slow (2min+), find another source." The PHASE
+        // owns one hard 120s budget shared by at most two attempts, and
+        // each attempt is capped to the remaining time — P2P can never
+        // cost more than two minutes before the resolve moves on.
+        let phase_start = Instant::now();
+        let phase_budget = Duration::from_secs(120);
         let mut p2p_tries = 0u32;
         for (service, _, r) in &p2p_hits {
-            // "Grab the seeded one": P2P gets a small number of shots with
-            // a tight wall-time budget, then the resolve moves on to
-            // direct sources.
-            if p2p_tries >= 3 || phase.elapsed() > Duration::from_secs(100) {
+            if p2p_tries >= 2 {
                 break;
             }
+            let Some(remaining) = phase_budget.checked_sub(phase_start.elapsed()) else {
+                break;
+            };
+            if remaining < Duration::from_secs(10) {
+                break; // not enough left to be worth starting
+            }
             p2p_tries += 1;
-            match self.attempt(downloader, query, service, r, tier, tier).await {
+            let attempt_fut = self.attempt(downloader, query, service, r, tier, tier);
+            let outcome = match tokio::time::timeout(remaining, attempt_fut).await {
+                Ok(res) => res,
+                Err(_) => {
+                    warn!("resolver: {service} blew the P2P time budget; moving on");
+                    Err(Error::Download(format!(
+                        "{service} exceeded the 120s P2P budget"
+                    )))
+                }
+            };
+            match outcome {
                 Ok(p) => return Ok(self.finish(service, query, p)),
                 Err(e) => {
                     self.record(service, 5.0, false);
