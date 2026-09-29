@@ -125,22 +125,17 @@ impl Resolver {
     fn default_chain(tier: QualityTier) -> Vec<&'static str> {
         match tier {
             QualityTier::Lossless => vec![
-                "soulseek",
-                "themfire",
-                "flacmusic",
-                "losslessalbums",
-                "exystence",
-                "musicrider",
-                "intmusic",
-                "discogc",
-                "ektoplazm",
-                "coreradio",
-                "alterportal",
+                // Direct-download sources first; P2P (soulseek) last: a
+                // hung transfer or dead swarm must never sit in front of
+                // a working HTTP source. Torrents (piratebay/darktorrent)
+                // are appended after this list when [torrent] enabled.
                 "technicaldeathmetal",
+                "coreradio",
+                "ektoplazm",
                 "relisten",
+                "soulseek",
             ],
             QualityTier::High => vec![
-                "soulseek",
                 "grimearchive",
                 "globaldjmix",
                 "zvu4it",
@@ -165,14 +160,13 @@ impl Resolver {
                 "mixtapemonkey",
                 "certifiedmixtapez",
                 "soundcloud",
+                "soulseek",
                 "youtube",
             ],
             QualityTier::Medium => vec![
                 "zvu4it",
                 "tancpol",
                 "iplusfree",
-                "soundcloud",
-                "youtube",
                 "mp3db",
                 "ccmixter",
                 "butterboy",
@@ -185,10 +179,14 @@ impl Resolver {
                 "testpressing",
                 "mp3zona",
                 "mp3tut",
+                "onetrance",
                 "systemsofromance",
                 "relisten",
                 "mixtapemonkey",
                 "certifiedmixtapez",
+                "soundcloud",
+                "soulseek",
+                "youtube",
             ],
             QualityTier::Low => vec![
                 "youtube",
@@ -258,10 +256,14 @@ impl Resolver {
             .filter(|s| torrents_on || (s != "piratebay" && s != "darktorrent"))
             .collect();
         // Deprioritise Opus-only providers so a native codec wins when the
-        // source offers one; otherwise fall back to the self-tuning score.
+        // source offers one. P2P (soulseek, torrents) stays pinned behind
+        // every direct source no matter how well it scored: a dead swarm
+        // or hung transfer in front is the worst failure mode. Within the
+        // remaining groups the self-tuning score still decides.
         out.sort_by(|a, b| {
-            let oa = is_opus_provider(a);
-            let ob = is_opus_provider(b);
+            let p2p = |s: &str| matches!(s, "soulseek" | "piratebay" | "darktorrent");
+            let oa = is_opus_provider(a) || p2p(a);
+            let ob = is_opus_provider(b) || p2p(b);
             oa.cmp(&ob).then_with(|| {
                 self.score_of(b)
                     .partial_cmp(&self.score_of(a))
@@ -311,6 +313,17 @@ impl Resolver {
                 to
             };
             let min_match = self.min_match;
+            // Torrent viability gate: a magnet with no seeders is a dead
+            // end that would hang the engine - never pick one below
+            // [torrent] min_seeders. PirateBay carries the count in
+            // `extra_kwargs.seeders`.
+            let min_seeders: u64 = self
+                .picaro
+                .merged_globals
+                .get("torrent")
+                .and_then(|v| v.get("min_seeders"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5);
             futs.push(async move {
                 let start = Instant::now();
                 let res = tokio::time::timeout(to, async {
@@ -322,6 +335,14 @@ impl Resolver {
                     let results = m.search(DownloadType::track, &q, None, 25).await.ok()?;
                     let mut best: Option<(f64, SearchResult)> = None;
                     for r in results {
+                        let seeders = r
+                            .extra_kwargs
+                            .get("seeders")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(u64::MAX);
+                        if seeders < min_seeders {
+                            continue;
+                        }
                         let s = score_result(&q, &r);
                         if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
                             best = Some((s, r));
@@ -434,33 +455,61 @@ impl Resolver {
                                 tier, query
                             )));
                         }
-                        let result = if is_direct_track(&r.service) {
-                            let mut data = HashMap::new();
-                            data.insert(
-                                "__track_name__".to_string(),
-                                serde_json::Value::String(r.name.clone()),
-                            );
-                            if let Some(a) = r.artists.first() {
+                        // Outer cap on the download attempt itself: the
+                        // race only bounds the SEARCH, so a hung P2P
+                        // transfer would otherwise block the whole chain
+                        // forever. Generous enough for healthy torrents.
+                        let download_cap = std::time::Duration::from_secs(
+                            self.picaro
+                                .merged_globals
+                                .get("resolver")
+                                .and_then(|v| v.get("download_timeout_secs"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(360)
+                                .max(60),
+                        );
+                        let result = tokio::time::timeout(download_cap, async {
+                            if is_direct_track(&r.service) {
+                                let mut data = HashMap::new();
                                 data.insert(
-                                    "__artist__".to_string(),
-                                    serde_json::Value::String(a.clone()),
+                                    "__track_name__".to_string(),
+                                    serde_json::Value::String(r.name.clone()),
                                 );
+                                if let Some(a) = r.artists.first() {
+                                    data.insert(
+                                        "__artist__".to_string(),
+                                        serde_json::Value::String(a.clone()),
+                                    );
+                                }
+                                downloader
+                                    .download_track_with_data(&r.service, &r.result_id, data)
+                                    .await
+                            } else {
+                                downloader
+                                    .download_album(&r.service, &r.result_id)
+                                    .await
+                                    .and_then(|files| {
+                                        pick_track(&files, query)
+                                            .or_else(|| files.into_iter().next())
+                                            .ok_or_else(|| {
+                                                Error::Download("album produced no files".into())
+                                            })
+                                    })
                             }
-                            downloader
-                                .download_track_with_data(&r.service, &r.result_id, data)
-                                .await
-                        } else {
-                            downloader
-                                .download_album(&r.service, &r.result_id)
-                                .await
-                                .and_then(|files| {
-                                    pick_track(&files, query)
-                                        .or_else(|| files.into_iter().next())
-                                        .ok_or_else(|| {
-                                            Error::Download("album produced no files".into())
-                                        })
-                                })
-                        };
+                        })
+                        .await
+                        .unwrap_or_else(|_| {
+                            warn!(
+                                "resolver: {} download exceeded {}s; moving on",
+                                r.service,
+                                download_cap.as_secs()
+                            );
+                            Err(Error::Download(format!(
+                                "{} download timed out after {}s",
+                                r.service,
+                                download_cap.as_secs()
+                            )))
+                        });
                         match result {
                             Ok(p) => {
                                 if quality_ok(&p, r.tier) {
@@ -488,11 +537,12 @@ impl Resolver {
                                 )));
                             }
                             Err(e) => {
-                                if album_based && !self.allow_mixed_sources {
-                                    // Don't assemble an album from multiple
-                                    // providers unless explicitly allowed.
-                                    return Err(e);
-                                }
+                                // Always fall through to the next source:
+                                // this is a single-track resolve, and a
+                                // failed container (dead torrent, 404
+                                // archive) must not abort the whole
+                                // chain. (`allow_mixed_sources` governs
+                                // album assembly, not this fallback.)
                                 warn!(
                                     "resolver: {} matched '{}' but download failed: {}",
                                     r.service, query, e

@@ -56,7 +56,8 @@ const SERVICE: &str = "Soulseek";
 const DEFAULT_SERVER_HOST: &str = "server.slsknet.org";
 const DEFAULT_SERVER_PORT: u16 = 2416;
 const DEFAULT_SEARCH_TIMEOUT_SECS: u64 = 15;
-const DEFAULT_DOWNLOAD_TIMEOUT_SECS: u64 = 600;
+// A hung P2P transfer must not hold a resolve hostage for 10 minutes.
+const DEFAULT_DOWNLOAD_TIMEOUT_SECS: u64 = 240;
 const REF_PREFIX: &str = "slsk:";
 
 // ---------------------------------------------------------------------------

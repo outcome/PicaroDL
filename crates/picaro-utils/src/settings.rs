@@ -330,7 +330,10 @@ pub fn default_global_settings() -> Map<String, Value> {
             "enable_zfill": true,
             "force_album_format": false,
             "use_playlist_position": false,
-            "use_album_position": false
+            "use_album_position": false,
+            // Uniform "<SongName> - <Artist> - (<CODEC>).<ext>" filenames
+            // across all sources, overriding the format templates above.
+            "normalize_filename": true
         }),
     );
     m.insert(

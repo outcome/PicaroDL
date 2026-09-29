@@ -198,17 +198,22 @@ pub async fn download_magnet(
      Some(b) => AddTorrent::from_bytes(b.clone()),
      None => AddTorrent::from_url(magnet.to_string()),
  };
- let list_resp = session
-  .add_torrent(
-  list_add,
-  Some(AddTorrentOptions {
-  list_only: true,
-  trackers: Some(list_trackers),
-  ..Default::default()
-  }),
-  )
-  .await
-  .map_err(|e| Error::Download(format!("torrent: metadata fetch failed: {e}")))?;
+ let list_resp = tokio::time::timeout(
+     // For magnets this step fetches metadata from peers; with a dead
+     // swarm it would hang forever. 60s is plenty for a healthy one.
+     Duration::from_secs(60),
+     session.add_torrent(
+     list_add,
+     Some(AddTorrentOptions {
+     list_only: true,
+     trackers: Some(list_trackers),
+     ..Default::default()
+     }),
+     ),
+ )
+ .await
+ .map_err(|_| Error::Download("torrent: metadata fetch timed out (no peers answered in 60s)".into()))?
+ .map_err(|e| Error::Download(format!("torrent: metadata fetch failed: {e}")))?;
 
     let listing = match list_resp {
         AddTorrentResponse::ListOnly(l) => l,
@@ -222,6 +227,7 @@ pub async fn download_magnet(
     // 2. Pick the audio file indices and compute the release size.
     let mut audio_indices: Vec<usize> = Vec::new();
     let mut total_bytes: u64 = 0;
+    let mut best_song: Option<(f64, usize, u64)> = None;
     for (idx, details) in listing
         .info
         .iter_file_details()
@@ -234,8 +240,16 @@ pub async fn download_magnet(
             .to_pathbuf()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        if is_audio_ext(Path::new(&name)) {
-            audio_indices.push(idx);
+        if !is_audio_ext(Path::new(&name)) {
+            continue;
+        }
+        audio_indices.push(idx);
+        // Song containment: when a single file's name is fully covered
+        // by the requested track ("Billie Jean" vs "CD1/03 Billie
+        // Jean.flac"), torrent ONLY that file instead of the album.
+        let c = name_containment(label, &name);
+        if best_song.as_ref().map_or(true, |(bc, _, _)| c > *bc) {
+            best_song = Some((c, idx, details.len));
         }
     }
 
@@ -245,7 +259,16 @@ pub async fn download_magnet(
         ));
     }
 
-    let size_gb = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    // Single-song download when one file clearly matches the request.
+    let (only_files, charged_bytes) = match best_song {
+        Some((c, idx, len)) if c >= 0.7 && !audio_indices.is_empty() => {
+            info!("torrent: song match in torrent ({c:.2}), downloading 1 file only");
+            (vec![idx], len)
+        }
+        _ => (audio_indices.clone(), total_bytes),
+    };
+
+    let size_gb = charged_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     if settings.max_size_gb > 0.0 && size_gb > settings.max_size_gb {
         return Err(Error::Download(format!(
             "torrent: release is {size_gb:.2} GB, over the {:.2} GB limit",
@@ -253,7 +276,8 @@ pub async fn download_magnet(
         )));
     }
     info!(
-        "torrent: {} audio file(s) of {} ({:.2} GB)",
+        "torrent: {} of {} audio file(s) of {} ({:.2} GB)",
+        only_files.len(),
         audio_indices.len(),
         listing.info.name.as_ref().map(|n| n.to_string()).unwrap_or_else(|| label.to_string()),
         size_gb
@@ -272,7 +296,7 @@ pub async fn download_magnet(
   .add_torrent(
   real_add,
   Some(AddTorrentOptions {
-  only_files: Some(audio_indices),
+  only_files: Some(only_files),
   overwrite: true,
   trackers: Some(add_trackers),
   ..Default::default()
@@ -313,7 +337,40 @@ pub async fn download_magnet(
         })
     };
 
-    let wait = handle.wait_until_completed().await;
+    // 4. Wait for completion, but abort when nothing has transferred for
+    // 90s: a zero-seed / unreachable swarm must fail fast instead of
+    // hanging the resolver forever.
+    let stall_secs: u64 = 90;
+    let watchdog = {
+        let handle = handle.clone();
+        async move {
+            let mut last = 0u64;
+            let mut stalled: u64 = 0;
+            loop {
+                let stats = handle.stats();
+                if stats.progress_bytes > last {
+                    last = stats.progress_bytes;
+                    stalled = 0;
+                } else {
+                    stalled += 5;
+                    if stalled >= stall_secs {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    };
+    let wait = tokio::select! {
+        r = handle.wait_until_completed() => r,
+        _ = watchdog => {
+            done.store(true, Ordering::Relaxed);
+            let _ = poll.await;
+            return Err(Error::Download(
+                "torrent: no transfer progress in {stall_secs}s (dead swarm / unreachable peers)".into(),
+            ));
+        }
+    };
     done.store(true, Ordering::Relaxed);
     let _ = poll.await;
 
@@ -334,4 +391,23 @@ pub async fn download_magnet(
     files.sort();
     info!("torrent: finished {} file(s)", files.len());
     Ok(files)
+}
+
+/// Token set for containment matching (mirrors textmatch, without the
+/// private helper).
+fn name_containment(label: &str, file_name: &str) -> f64 {
+    let toks = |s: &str| -> std::collections::HashSet<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| t.len() >= 2 && !t.chars().all(|c| c.is_ascii_digit()))
+            .map(|t| t.to_string())
+            .collect()
+    };
+    let lt = toks(label);
+    let ft = toks(file_name);
+    if lt.is_empty() || ft.is_empty() {
+        return 0.0;
+    }
+    let hits = ft.iter().filter(|t| lt.contains(*t)).count() as f64;
+    hits / ft.len() as f64
 }

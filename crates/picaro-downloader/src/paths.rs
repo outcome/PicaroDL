@@ -269,6 +269,34 @@ pub fn build_track_filename(
     );
 
     let mut name = format_template(&template, &vars);
+    // "Normalize filename" (default on): uniform
+    // "<SongName> - <Artist> - (<CODEC>).<ext>" filenames across every
+    // source, instead of per-format templates.
+    let normalize = settings
+        .formatting()
+        .get("normalize_filename")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if normalize {
+        let codec_disp = {
+            let c = track.codec.pretty().to_uppercase();
+            if c.is_empty() || c == "UNKNOWN" || c == "ERROR" {
+                codec_extension.to_uppercase()
+            } else {
+                c
+            }
+        };
+        let song = vars
+            .get("track_name")
+            .cloned()
+            .unwrap_or_else(|| sanitise_name(&track.name));
+        let artist_disp = vars.get("artist").cloned().unwrap_or_default();
+        name = if artist_disp.is_empty() {
+            format!("{song} - ({codec_disp})")
+        } else {
+            format!("{song} - {artist_disp} - ({codec_disp})")
+        };
+    }
     if !name
         .to_lowercase()
         .ends_with(&format!(".{codec_extension}"))
