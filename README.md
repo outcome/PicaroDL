@@ -216,7 +216,7 @@ of the box.
 | `p2p.enabled` | `true` | Soulseek peer-to-peer (set `false` or `PICARO_ENABLE_P2P=0` to opt out) |
 | `p2p.min_speed_kbps` | `128` | a P2P transfer averaging below this counts as a strike |
 | `p2p.slow_strikes` | `3` | strikes in a row benches the service (skipped, including its search) |
-| `p2p.probe_interval` | `10` | resolves between probe attempts for a benched service |
+| `p2p.bench_minutes` | `10` | how long a bench lasts — recovery is wall-clock, then full standing |
 | `torrent.enabled` | `false` | BitTorrent downloads (PirateBay magnets, DarkTorrent `.torrent`s); opt in to allow P2P torrent traffic |
 | `torrent.min_seeders` | `5` | torrents below this seeder count are never picked |
 | `torrent.max_size_gb` | `8` | refuse oversized releases (the selected file, for song requests) |
@@ -238,10 +238,10 @@ budget.
 `p2p.min_speed_kbps` (or failing outright) counts as a strike;
 `p2p.slow_strikes` strikes in a row **benches** the service — it's skipped
 entirely, search included, so resolves stay as fast as the direct pool —
-until `p2p.probe_interval` resolves pass and it gets one probe attempt to
-redeem itself. State persists in `config/p2p-health.json`. Benchmarks: the
-same song that took 142.6s through a stalling peer resolved in **9.9s** with
-the slow service benched.
+for `p2p.bench_minutes`, after which it returns at full standing on wall-clock
+time (no probe counters to satisfy). State persists in
+`config/p2p-health.json`. Benchmarks: the same song that took 142.6s through
+a stalling peer resolved in **9.9s** with the slow service benched.
 
 ### BitTorrent / torrents
 

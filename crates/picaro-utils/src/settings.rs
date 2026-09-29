@@ -375,11 +375,12 @@ pub fn default_global_settings() -> Map<String, Value> {
             "enabled": true,
             // P2P auto-degrade: a transfer slower than this (average) counts
             // as a strike; slow_strikes strikes in a row benches the service
-            // (skipped entirely, including its search) until probe_interval
-            // resolves pass, when it gets one probe attempt to redeem itself.
+            // (skipped entirely, including its search) until the bench
+            // expires - recovery is wall-clock (bench_minutes), not
+            // resolve-count.
             "min_speed_kbps": 128,
             "slow_strikes": 3,
-            "probe_interval": 10
+            "bench_minutes": 10
         }),
     );
     m.insert(

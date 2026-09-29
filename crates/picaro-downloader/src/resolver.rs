@@ -65,11 +65,20 @@ pub struct Resolver {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct P2PHealth {
     strikes: u32,
-    benched: bool,
+    /// Unix timestamp (seconds) until which the service is benched;
+    /// 0 = not benched. Time-based: after `p2p.bench_minutes` the
+    /// service returns at full standing on its own.
+    #[serde(default)]
+    benched_until: u64,
+    #[serde(default)]
     last_speed_kbps: f64,
-    /// Resolves passed since the service was benched; a probe is allowed
-    /// every `p2p.probe_interval` resolves.
-    since_probe: u32,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl Resolver {
@@ -512,14 +521,19 @@ impl Resolver {
         }
         // Bench the slow: a P2P service with a recent record of slow or
         // failed transfers sits the whole resolve out (its search, too -
-        // Soulseek's 15s window is the fixed cost we most want to skip),
-        // until its probe interval comes due.
+        // Soulseek's 15s window is the fixed cost we most want to skip)
+        // until its bench expires on wall-clock time.
         let g = GlobalSettings::from_merged(&self.picaro.merged_globals);
-        let probe_interval = g.get_int_or("p2p", "probe_interval", 10).max(1) as u32;
+        let bench_minutes = g
+            .get("p2p", "bench_minutes")
+            .and_then(|v| v.as_u64())
+            .or_else(|| g.get("p2p", "bench_minutes").and_then(|v| v.as_f64().map(|f| f as u64)))
+            .unwrap_or(10)
+            .max(1);
         let min_speed_kbps =
             g.get("p2p", "min_speed_kbps").and_then(|v| v.as_f64()).unwrap_or(128.0);
         let slow_strikes = g.get_int_or("p2p", "slow_strikes", 3).max(1) as u32;
-        services.retain(|s| !is_p2p(s) || self.p2p_allowed_in_wave(s, probe_interval));
+        services.retain(|s| !is_p2p(s) || self.p2p_allowed_in_wave(s));
         services.dedup();
         if services.is_empty() {
             return Err(Error::Other(format!("resolver: no source has '{query}'")));
@@ -671,11 +685,25 @@ impl Resolver {
                         .unwrap_or(0.0)
                         / 1024.0;
                     let speed = kb / dt;
-                    self.p2p_report(service, true, speed, min_speed_kbps, slow_strikes);
+                    self.p2p_report(
+                        service,
+                        true,
+                        speed,
+                        min_speed_kbps,
+                        slow_strikes,
+                        bench_minutes,
+                    );
                     return Ok(self.finish(service, query, p));
                 }
                 Err(e) => {
-                    self.p2p_report(service, false, 0.0, min_speed_kbps, slow_strikes);
+                    self.p2p_report(
+                        service,
+                        false,
+                        0.0,
+                        min_speed_kbps,
+                        slow_strikes,
+                        bench_minutes,
+                    );
                     self.record(service, 5.0, false);
                     warn!("resolver: {} matched '{}' but failed: {}", service, query, e);
                     last_err = Some(e);
@@ -825,26 +853,24 @@ impl Resolver {
     }
 
     /// May this P2P service join the search wave? Benched services sit
-    /// out until `p2p.probe_interval` resolves pass, then rejoin for one
-    /// probe attempt.
-    fn p2p_allowed_in_wave(&mut self, service: &str, probe_interval: u32) -> bool {
+    /// out until their bench expires, then return at full standing —
+    /// recovery is wall-clock, not resolve-count.
+    fn p2p_allowed_in_wave(&mut self, service: &str) -> bool {
         let h = self.health.entry(service.to_string()).or_default();
-        if !h.benched {
+        if h.benched_until == 0 || unix_now() >= h.benched_until {
+            if h.benched_until != 0 {
+                info!("resolver: {service} bench expired - back in the wave");
+                h.benched_until = 0;
+                h.strikes = 0;
+            }
             return true;
         }
-        h.since_probe += 1;
-        if h.since_probe >= probe_interval {
-            h.since_probe = 0;
-            info!("resolver: {service} benched for slowness - probe attempt");
-            true
-        } else {
-            false
-        }
+        false
     }
 
     /// Record a P2P attempt outcome: successes below `min_speed_kbps` and
     /// failures count as strikes; `slow_strikes` in a row benches the
-    /// service.
+    /// service for `bench_minutes`.
     fn p2p_report(
         &mut self,
         service: &str,
@@ -852,27 +878,27 @@ impl Resolver {
         speed_kbps: f64,
         min_speed_kbps: f64,
         slow_strikes: u32,
+        bench_minutes: u64,
     ) {
         let h = self.health.entry(service.to_string()).or_default();
         if ok {
             h.last_speed_kbps = speed_kbps;
             if speed_kbps >= min_speed_kbps {
-                if h.benched {
+                if h.benched_until != 0 {
                     info!("resolver: {service} unbenched (delivered at {speed_kbps:.0} kbps)");
                 }
                 h.strikes = 0;
-                h.benched = false;
+                h.benched_until = 0;
                 self.save_health();
                 return;
             }
         }
         h.strikes += 1;
-        if h.strikes >= slow_strikes && !h.benched {
-            h.benched = true;
-            h.since_probe = 0;
+        if h.strikes >= slow_strikes && h.benched_until < unix_now() {
+            h.benched_until = unix_now() + bench_minutes * 60;
             warn!(
-                "resolver: benching {service} - consistently slow/failing P2P \
-                 (last speed {:.0} kbps, min {min_speed_kbps:.0}); skipping it for now",
+                "resolver: benching {service} for {bench_minutes} min - consistently slow/failing P2P \
+                 (last speed {:.0} kbps, min {min_speed_kbps:.0})",
                 h.last_speed_kbps
             );
         }
