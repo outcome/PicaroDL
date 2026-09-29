@@ -64,36 +64,40 @@ Nothing waits on a slow source. Nothing asks you to log in.
 ## Benchmark
 
 10 songs run at `--quality lossless` (fallback allowed), full-chain resolve,
-Sept 2026, debug build on Windows, residential connection. Total: ~19.7 min,
-10/10 resolved, 2/10 in true lossless.
+Sept 2026, debug build on Windows, residential connection. Total: ~15.1 min,
+10/10 resolved, 4/10 in true lossless.
 
-| # | Song | Time | Source | Resolved | Size |
+| # | Song | Time | Source | Delivered | Size |
 |---|---|---|---|---|---|
-| 1 | Queen — Bohemian Rhapsody | 24.5 s | PirateBay | FLAC (lossless) | 33.0 MB |
-| 2 | Michael Jackson — Billie Jean | 91.5 s | Tancpol | MP3 (high) | 8.1 MB |
-| 3 | The Beatles — Hey Jude | 99.5 s | Mp3Tut | MP3 (high) | 7.0 MB |
-| 4 | Daft Punk — One More Time | 87.5 s | Soulseek | FLAC (lossless) | 38.9 MB |
-| 5 | Nirvana — Come As You Are | 92.3 s | Tancpol | MP3 (high) | 8.5 MB |
-| 6 | Radiohead — Paranoid Android | 93.4 s | Tancpol | MP3 (high) | 5.3 MB |
-| 7 | Aphex Twin — Xtal | 36.2 s | Zvu4it | MP3 (high) | 13.3 MB |
-| 8 | Burial — Archangel | 280.6 s | Zvu4it | MP3 (high) | 2.8 MB |
-| 9 | Boards of Canada — Roygbiv | 100.0 s | Zvu4it | MP3 (high) | 5.7 MB |
-| 10 | Z LEAF — Hidden Temple | 277.2 s | OneTrance | MP3 (high) | 2.1 MB |
+| 1 | Queen — Bohemian Rhapsody | 87.0 s | Soulseek | FLAC | 122.4 MB |
+| 2 | Michael Jackson — Billie Jean | 39.7 s | Zvu4it | MP3 | 11.3 MB |
+| 3 | The Beatles — Hey Jude | 34.7 s | Mp3Tut | MP3 | 7.0 MB |
+| 4 | Daft Punk — One More Time | 152.4 s | Tancpol | MP3 | 8.9 MB |
+| 5 | Nirvana — Come As You Are | 25.9 s | Soulseek | FLAC | 24.7 MB |
+| 6 | Radiohead — Paranoid Android | 43.9 s | Soulseek | FLAC | 45.8 MB |
+| 7 | Aphex Twin — Xtal | 24.3 s | Soulseek | FLAC | 31.3 MB |
+| 8 | Burial — Archangel | 144.3 s | Zvu4it | MP3 | 2.9 MB |
+| 9 | Boards of Canada — Roygbiv | 206.9 s | Zvu4it | MP3 | 5.7 MB |
+| 10 | Z LEAF — Hidden Temple | 147.0 s | Mp3Tut | MP3 | 7.1 MB |
+
+How a resolve works now: **one search wave** queries every source at once
+(no tier-by-tier re-searching), then candidates are tried in order —
+direct lossless first, seeded P2P next (max 3 shots inside a ~100s budget;
+the torrent engine abandons any swarm still under 70% after 120s), then
+direct MP3 sources, then Opus streams. Lossless requests filter lossy
+torrent files before downloading a single byte.
 
 Reading the results:
 
-- **Popular songs resolve fast** when a seeded torrent or direct source exists
-  (Bohemian Rhapsody: single-file FLAC torrent in 24.5s).
-- **The 90–100s cluster** is mostly a dead torrent fast-failing (60s metadata
-  cap) before a direct MP3 source wins — the price of trying lossless first
-  with torrents enabled.
-- **The ~280s runs** were dominated by a Soulseek peer that accepted the
-  connection but never delivered; its 240s transfer cap fires and the chain
-  moves on. Set `PICARO_SOULSEEK_DOWNLOAD_TIMEOUT` lower if you prefer
-  snappier fallbacks.
-- True lossless for popular catalogue mostly comes from torrents and Soulseek;
-  the rest of the pool is MP3 320-adjacent, so `--quality lossless` often
-  settles at `high` by design.
+- **When lossless exists, it arrives fast**: all four FLACs came via
+  Soulseek in 24–87s.
+- **The 140–210s cluster** is the P2P phase honestly spending its budget
+  on swarms that stall or turn out lossy-only, before a direct MP3 wins.
+  That's the price of trying lossless first with P2P enabled; lower
+  `PICARO_SOULSEEK_DOWNLOAD_TIMEOUT` or disable torrents for snappier
+  fallbacks.
+- A lossless request that ends in MP3 is by design (fallback), and the
+  resolver log says which actually landed.
 
 ## Providers
 
