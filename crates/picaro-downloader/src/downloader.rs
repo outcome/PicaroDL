@@ -503,6 +503,7 @@ impl Downloader {
                         &settings,
                         Some(self.events.0.clone()),
                         &track_info.name,
+                        self.picaro.current_quality().contains(picaro_utils::models::Quality::LOSSLESS),
                     )
                     .await?;
  match crate::mega::pick_best_file(&files, &track_info.name) {
@@ -1095,6 +1096,7 @@ impl Downloader {
                         &settings,
                         Some(self.events.0.clone()),
                         &track_info.name,
+                        self.picaro.current_quality().contains(picaro_utils::models::Quality::LOSSLESS),
                     )
                     .await?;
  match crate::mega::pick_best_file(&files, &track_info.name) {
@@ -1470,6 +1472,7 @@ impl Downloader {
             &settings,
             Some(self.events.0.clone()),
             "magnet",
+            false,
         )
         .await?;
         let _ = self.events.0.send(DownloadEvent::Finished {

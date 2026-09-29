@@ -420,6 +420,20 @@ impl Resolver {
     }
 
     /// Resolve and download, falling back across providers and tiers.
+    ///
+    /// ONE search wave queries every source at once — no tier-by-tier
+    /// sweeps that re-search the same sites four times. Candidates then
+    /// run in priority order:
+    ///
+    ///   1. direct lossless sources (fast HTTP FLAC)
+    ///   2. seeded P2P (torrents / Soulseek) — the torrent engine drops
+    ///      a swarm that is still under 70% after 120s, so P2P never
+    ///      holds the resolve hostage
+    ///   3. direct MP3 sources
+    ///   4. Opus stream providers
+    ///
+    /// The requested tier is a ceiling: sources that only deliver
+    /// higher-tier content sit out when a lower tier was asked for.
     pub async fn resolve_and_download(
         &mut self,
         downloader: &Downloader,
@@ -427,141 +441,356 @@ impl Resolver {
         tier: QualityTier,
     ) -> Result<PathBuf> {
         let mut last_err: Option<Error> = None;
-        for t in tier.fallback_order() {
-            let mut chain = self.chain_for(t);
-            if chain.is_empty() {
-                continue;
-            }
-            info!("resolver: tier {} -> {}", t.as_str(), chain.join(", "));
-            while !chain.is_empty() {
-                let batch: Vec<String> = chain
-                    .iter()
-                    .take(self.max_parallel.max(1))
-                    .cloned()
-                    .collect();
-                let (hit, obs) = self.race(t, query, &batch).await;
-                for (s, dt, ok) in obs {
-                    self.record(&s, dt, ok);
+        let min_match = self.min_match;
+
+        let is_p2p = |s: &str| matches!(s, "soulseek" | "piratebay" | "darktorrent");
+        let lossless_src = |s: &str| {
+            matches!(
+                s,
+                "technicaldeathmetal" | "coreradio" | "ektoplazm" | "relisten"
+            )
+        };
+
+        // Service pool: --only, or the union of every tier's chain.
+        let mut services: Vec<String> = match &self.allow {
+            Some(a) => a.clone(),
+            None => {
+                let mut v: Vec<String> = Vec::new();
+                for t in [
+                    QualityTier::Lossless,
+                    QualityTier::High,
+                    QualityTier::Medium,
+                    QualityTier::Low,
+                ] {
+                    for s in Self::default_chain(t) {
+                        if !v.iter().any(|x| x == s) {
+                            v.push(s.to_string());
+                        }
+                    }
                 }
-                match hit {
-                    Some(r) => {
-                        let album_based = !is_direct_track(&r.service);
-                        // Album assembly is opt-in: refuse a different tier for
-                        // an album unless `allow_mixed_quality` is set. Direct
-                        // track sources keep their full resilient fallback.
-                        if album_based && !self.allow_mixed_quality && t != tier {
-                            return Err(Error::Other(format!(
-                                "no {:?}-quality source for '{}'; set resolver.allow_mixed_quality=true to allow a different tier",
-                                tier, query
-                            )));
-                        }
-                        // Outer cap on the download attempt itself: the
-                        // race only bounds the SEARCH, so a hung P2P
-                        // transfer would otherwise block the whole chain
-                        // forever. Generous enough for healthy torrents.
-                        let download_cap = std::time::Duration::from_secs(
-                            self.picaro
-                                .merged_globals
-                                .get("resolver")
-                                .and_then(|v| v.get("download_timeout_secs"))
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(360)
-                                .max(60),
-                        );
-                        let result = tokio::time::timeout(download_cap, async {
-                            if is_direct_track(&r.service) {
-                                let mut data = HashMap::new();
-                                data.insert(
-                                    "__track_name__".to_string(),
-                                    serde_json::Value::String(r.name.clone()),
-                                );
-                                if let Some(a) = r.artists.first() {
-                                    data.insert(
-                                        "__artist__".to_string(),
-                                        serde_json::Value::String(a.clone()),
-                                    );
-                                }
-                                downloader
-                                    .download_track_with_data(&r.service, &r.result_id, data)
-                                    .await
-                            } else {
-                                downloader
-                                    .download_album(&r.service, &r.result_id)
-                                    .await
-                                    .and_then(|files| {
-                                        pick_track(&files, query)
-                                            .or_else(|| files.into_iter().next())
-                                            .ok_or_else(|| {
-                                                Error::Download("album produced no files".into())
-                                            })
-                                    })
-                            }
-                        })
-                        .await
-                        .unwrap_or_else(|_| {
-                            warn!(
-                                "resolver: {} download exceeded {}s; moving on",
-                                r.service,
-                                download_cap.as_secs()
-                            );
-                            Err(Error::Download(format!(
-                                "{} download timed out after {}s",
-                                r.service,
-                                download_cap.as_secs()
-                            )))
-                        });
-                        match result {
-                            Ok(p) => {
-                                if quality_ok(&p, r.tier) {
-                                    self.record(&r.service, 0.5, true);
-                                    save_scores(&self.scores_path, &self.scores);
-                                    info!(
-                                        "resolver: '{}' -> {} [{}]",
-                                        query,
-                                        r.service,
-                                        r.tier.as_str()
-                                    );
-                                    return Ok(p);
-                                }
-                                warn!(
-                                    "resolver: {} returned a file that doesn't match {} quality (wrong container / likely fake); retrying next source",
-                                    r.service,
-                                    r.tier.as_str()
-                                );
-                                self.record(&r.service, 5.0, false);
-                                let _ = std::fs::remove_file(&p);
-                                chain.retain(|s| *s != r.service);
-                                last_err = Some(Error::Other(format!(
-                                    "quality mismatch from {}",
-                                    r.service
-                                )));
-                            }
-                            Err(e) => {
-                                // Always fall through to the next source:
-                                // this is a single-track resolve, and a
-                                // failed container (dead torrent, 404
-                                // archive) must not abort the whole
-                                // chain. (`allow_mixed_sources` governs
-                                // album assembly, not this fallback.)
-                                warn!(
-                                    "resolver: {} matched '{}' but download failed: {}",
-                                    r.service, query, e
-                                );
-                                self.record(&r.service, 5.0, false);
-                                chain.retain(|s| *s != r.service);
-                                last_err = Some(e);
-                            }
-                        }
+                let torrents_on = self
+                    .picaro
+                    .merged_globals
+                    .get("torrent")
+                    .and_then(|v| v.get("enabled"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                for m in ["piratebay", "darktorrent"] {
+                    if torrents_on && !v.iter().any(|x| x == m) {
+                        v.push(m.to_string());
                     }
-                    None => {
-                        chain.retain(|s| !batch.contains(s));
-                    }
+                }
+                v.into_iter().filter(|s| self.registered(s)).collect()
+            }
+        };
+        // Ceiling: a FLAC-only source doesn't join when a lower tier
+        // was requested (the request is never upgraded).
+        if tier != QualityTier::Lossless {
+            services.retain(|s| !lossless_src(s));
+        }
+        services.dedup();
+        if services.is_empty() {
+            return Err(Error::Other(format!("resolver: no source has '{query}'")));
+        }
+        info!("resolver: wave [{}] -> {}", tier.as_str(), services.join(", "));
+
+        // Fire every search simultaneously. P2P windows are longer:
+        // Soulseek's own search waits ~15s for peers to answer.
+        let min_seeders: u64 = self
+            .picaro
+            .merged_globals
+            .get("torrent")
+            .and_then(|v| v.get("min_seeders"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5);
+        let mut direct_futs = FuturesUnordered::new();
+        let mut p2p_futs = FuturesUnordered::new();
+        for s in services {
+            let p2p = is_p2p(&s);
+            let to = if p2p {
+                self.timeout.max(Duration::from_secs(25))
+            } else {
+                self.timeout
+            };
+            let picaro = self.picaro.clone();
+            let q = query.to_string();
+            let fut = async move {
+                let start = Instant::now();
+                let hits = search_service_hits(&picaro, &s, &q, min_match, min_seeders, to).await;
+                (s, start.elapsed().as_secs_f64(), hits)
+            };
+            if p2p {
+                p2p_futs.push(fut);
+            } else {
+                direct_futs.push(fut);
+            }
+        }
+
+        // Collect direct hits (all bounded by the probe timeout; a short
+        // grace covers module loading).
+        let mut direct_hits: Vec<(String, f64, SearchResult)> = Vec::new();
+        let direct_deadline =
+            tokio::time::Instant::from_std(Instant::now() + self.timeout + Duration::from_secs(4));
+        while let Some((s, dt, hits)) = tokio::time::timeout_at(direct_deadline, direct_futs.next())
+            .await
+            .ok()
+            .flatten()
+        {
+            let found = hits.as_ref().map_or(false, |h| !h.is_empty());
+            self.record(&s, dt, found);
+            if let Some(h) = hits {
+                for (score, r) in h {
+                    direct_hits.push((s.clone(), score, r));
                 }
             }
         }
+
+        // Group 1: direct lossless sources. Fast HTTP FLAC beats P2P at
+        // equal quality.
+        let mut g_lossless: Vec<_> = direct_hits
+            .iter()
+            .filter(|(s, _, _)| lossless_src(s))
+            .cloned()
+            .collect::<Vec<(String, f64, SearchResult)>>();
+        g_lossless.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (service, _, r) in &g_lossless {
+            match self
+                .attempt(downloader, query, service, r, QualityTier::Lossless, tier)
+                .await
+            {
+                Ok(p) => return Ok(self.finish(service, query, tier, p)),
+                Err(e) => {
+                    self.record(service, 5.0, false);
+                    warn!("resolver: {} matched '{}' but failed: {}", service, query, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        // Group 2: P2P. Only seeded torrents survive the search filter;
+        // the torrent engine enforces the 120s / 70% rule and Soulseek
+        // caps transfers at 120s. The phase itself gives up after ~100s
+        // of wall time so a dead first swarm doesn't stack a second.
+        let mut p2p_hits: Vec<(String, f64, SearchResult)> = Vec::new();
+        let p2p_deadline =
+            tokio::time::Instant::from_std(Instant::now() + Duration::from_secs(30));
+        while let Some((s, dt, hits)) = tokio::time::timeout_at(p2p_deadline, p2p_futs.next())
+            .await
+            .ok()
+            .flatten()
+        {
+            let found = hits.as_ref().map_or(false, |h| !h.is_empty());
+            self.record(&s, dt, found);
+            if let Some(h) = hits {
+                for (score, r) in h {
+                    p2p_hits.push((s.clone(), score, r));
+                }
+            }
+        }
+        p2p_hits.sort_by(|a, b| {
+            let seeders = |r: &SearchResult| {
+                r.extra_kwargs
+                    .get("seeders")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+            };
+            seeders(&b.2)
+                .cmp(&seeders(&a.2))
+                .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let phase = Instant::now();
+        let mut p2p_tries = 0u32;
+        for (service, _, r) in &p2p_hits {
+            // "Grab the seeded one": P2P gets a small number of shots with
+            // a tight wall-time budget, then the resolve moves on to
+            // direct sources.
+            if p2p_tries >= 3 || phase.elapsed() > Duration::from_secs(100) {
+                break;
+            }
+            p2p_tries += 1;
+            match self.attempt(downloader, query, service, r, tier, tier).await {
+                Ok(p) => return Ok(self.finish(service, query, tier, p)),
+                Err(e) => {
+                    self.record(service, 5.0, false);
+                    warn!("resolver: {} matched '{}' but failed: {}", service, query, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        // Group 3: direct MP3 sources (best-scored first), then group 4:
+        // Opus stream providers.
+        let expected_direct = if tier == QualityTier::Lossless {
+            QualityTier::High
+        } else {
+            tier
+        };
+        let mut g_direct: Vec<_> = direct_hits
+            .iter()
+            .filter(|(s, _, _)| !lossless_src(s) && !is_opus_provider(s))
+            .cloned()
+            .collect::<Vec<(String, f64, SearchResult)>>();
+        g_direct.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (service, _, r) in g_direct {
+            match self
+                .attempt(downloader, query, &service, &r, expected_direct, tier)
+                .await
+            {
+                Ok(p) => return Ok(self.finish(&service, query, tier, p)),
+                Err(e) => {
+                    self.record(&service, 5.0, false);
+                    warn!("resolver: {} matched '{}' but failed: {}", service, query, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+        let mut g_opus: Vec<_> = direct_hits
+            .iter()
+            .filter(|(s, _, _)| is_opus_provider(s))
+            .cloned()
+            .collect::<Vec<(String, f64, SearchResult)>>();
+        g_opus.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (service, _, r) in g_opus {
+            match self
+                .attempt(downloader, query, &service, &r, tier, tier)
+                .await
+            {
+                Ok(p) => return Ok(self.finish(&service, query, tier, p)),
+                Err(e) => {
+                    self.record(&service, 5.0, false);
+                    warn!("resolver: {} matched '{}' but failed: {}", service, query, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+
         save_scores(&self.scores_path, &self.scores);
         Err(last_err.unwrap_or_else(|| Error::Other(format!("resolver: no source has '{query}'"))))
     }
+
+    /// Download one candidate (direct track or album container), verify
+    /// quality against `expected`, and hand back the produced path.
+    async fn attempt(
+        &self,
+        downloader: &Downloader,
+        query: &str,
+        service: &str,
+        hit: &SearchResult,
+        expected: QualityTier,
+        _ceiling: QualityTier,
+    ) -> Result<PathBuf> {
+        let name = hit.name.clone().unwrap_or_default();
+        let result_id = hit.result_id.clone();
+        let artists = hit.artists.clone().unwrap_or_default();
+        let cap_secs = self
+            .picaro
+            .merged_globals
+            .get("resolver")
+            .and_then(|v| v.get("download_timeout_secs"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(360)
+            .max(60);
+        let cap = Duration::from_secs(cap_secs);
+        let result = tokio::time::timeout(cap, async {
+            if is_direct_track(service) {
+                let mut data = HashMap::new();
+                data.insert(
+                    "__track_name__".to_string(),
+                    serde_json::Value::String(name.clone()),
+                );
+                if let Some(a) = artists.first() {
+                    data.insert("__artist__".to_string(), serde_json::Value::String(a.clone()));
+                }
+                downloader
+                    .download_track_with_data(service, &result_id, data)
+                    .await
+            } else {
+                downloader
+                    .download_album(service, &result_id)
+                    .await
+                    .and_then(|files| {
+                        pick_track(&files, query)
+                            .or_else(|| files.into_iter().next())
+                            .ok_or_else(|| Error::Download("album produced no files".into()))
+                    })
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            warn!("resolver: {service} download exceeded {cap_secs}s; moving on");
+            Err(Error::Download(format!(
+                "{service} download timed out after {cap_secs}s"
+            )))
+        });
+        let p = result?;
+        if !quality_ok(&p, expected) {
+            let _ = std::fs::remove_file(&p);
+            return Err(Error::Download(format!(
+                "{service} returned a file that doesn't match {expected:?} quality (wrong container / likely fake)"
+            )));
+        }
+        Ok(p)
+    }
+
+    fn finish(&mut self, service: &str, query: &str, tier: QualityTier, p: PathBuf) -> PathBuf {
+        self.record(service, 0.5, true);
+        save_scores(&self.scores_path, &self.scores);
+        info!("resolver: '{}' -> {} [{}]", query, service, tier.as_str());
+        p
+    }
+}
+
+/// Search one service and return every result that clears `min_match`
+/// (plus the ` - `-stripped retry when the first pass finds nothing).
+/// Torrent results below `min_seeders` are dropped before they can be
+/// picked — a dead swarm must never be attempted.
+async fn search_service_hits(
+    picaro: &std::sync::Arc<Picaro>,
+    service: &str,
+    q: &str,
+    min_match: f64,
+    min_seeders: u64,
+    to: Duration,
+) -> Option<Vec<(f64, SearchResult)>> {
+    tokio::time::timeout(to, async {
+        let m = picaro.load_module(service).await.ok()?;
+        // 25, not 8: weak-search modules (blogspot labels, DLE recency
+        // sidebars) push real matches deep into the result list.
+        let mut hits: Vec<(f64, SearchResult)> = Vec::new();
+        let mut scan = |results: Vec<SearchResult>, hits: &mut Vec<(f64, SearchResult)>| {
+            for r in results {
+                let seeders = r
+                    .extra_kwargs
+                    .get("seeders")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(u64::MAX);
+                if seeders < min_seeders {
+                    continue;
+                }
+                let s = score_result(q, &r);
+                if s >= min_match {
+                    hits.push((s, r));
+                }
+            }
+        };
+        match m.search(DownloadType::track, q, None, 25).await {
+            Ok(results) => scan(results, &mut hits),
+            Err(_) => {}
+        }
+        // Many sites phrase-match the " - " separator and return nothing
+        // for "artist - title" queries; retry with plain words (scored
+        // against the original query).
+        if hits.is_empty() && q.contains(" - ") {
+            let alt = q.replace(" - ", " ");
+            if let Ok(more) = m.search(DownloadType::track, &alt, None, 25).await {
+                scan(more, &mut hits);
+            }
+        }
+        Some(hits)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Providers that resolve a single track URL directly (vs album/archive pages).

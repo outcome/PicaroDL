@@ -103,6 +103,15 @@ fn is_audio_ext(path: &Path) -> bool {
     })
 }
 
+fn is_lossless_ext(path: &Path) -> bool {
+    path.extension().map_or(false, |e| {
+        matches!(
+            e.to_str().unwrap_or("").to_ascii_lowercase().as_str(),
+            "flac" | "wav" | "aiff" | "aif" | "ape" | "wv"
+        )
+    })
+}
+
 /// Recursively collect every audio file under `dir`.
 fn collect_audio_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
@@ -135,6 +144,7 @@ pub async fn download_magnet(
     settings: &TorrentSettings,
     events: Option<crossbeam_channel::Sender<DownloadEvent>>,
     label: &str,
+    require_lossless: bool,
 ) -> Result<Vec<PathBuf>> {
     if !settings.enabled {
         return Err(Error::Download(
@@ -243,20 +253,34 @@ pub async fn download_magnet(
         if !is_audio_ext(Path::new(&name)) {
             continue;
         }
+        // A lossless request never pulls lossy files: discovering this
+        // AFTER a full download wastes the whole transfer.
+        if require_lossless && !is_lossless_ext(Path::new(&name)) {
+            continue;
+        }
         audio_indices.push(idx);
         // Song containment: when a single file's name is fully covered
         // by the requested track ("Billie Jean" vs "CD1/03 Billie
         // Jean.flac"), torrent ONLY that file instead of the album.
-        let c = name_containment(label, &name);
+        // Compare against the file STEM - listing names carry the whole
+        // relative path, and folder-name tokens would dilute the score.
+        let stem = Path::new(&name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&name)
+            .to_string();
+        let c = name_containment(label, &stem);
         if best_song.as_ref().map_or(true, |(bc, _, _)| c > *bc) {
             best_song = Some((c, idx, details.len));
         }
     }
 
     if audio_indices.is_empty() {
-        return Err(Error::Download(
-            "torrent: release contains no audio files".into(),
-        ));
+        return Err(Error::Download(if require_lossless {
+            "torrent: release contains no lossless audio (only lossy files)".into()
+        } else {
+            "torrent: release contains no audio files".into()
+        }));
     }
 
     // Single-song download when one file clearly matches the request.
@@ -337,27 +361,38 @@ pub async fn download_magnet(
         })
     };
 
-    // 4. Wait for completion, but abort when nothing has transferred for
-    // 90s: a zero-seed / unreachable swarm must fail fast instead of
-    // hanging the resolver forever.
-    let stall_secs: u64 = 90;
+    // 4. Wait for completion with a speed contract: a swarm that is still
+    // under 70% after 120s is abandoned (fall back to lower quality),
+    // and any transfer that stalls for 90s straight dies outright.
     let watchdog = {
         let handle = handle.clone();
         async move {
+            let started = std::time::Instant::now();
             let mut last = 0u64;
             let mut stalled: u64 = 0;
             loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
                 let stats = handle.stats();
                 if stats.progress_bytes > last {
                     last = stats.progress_bytes;
                     stalled = 0;
                 } else {
                     stalled += 5;
-                    if stalled >= stall_secs {
+                    if stalled >= 90 {
                         return;
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                let elapsed = started.elapsed().as_secs();
+                if elapsed >= 120 {
+                    let frac = if stats.total_bytes > 0 {
+                        stats.progress_bytes as f64 / stats.total_bytes as f64
+                    } else {
+                        0.0
+                    };
+                    if frac < 0.7 {
+                        return;
+                    }
+                }
             }
         }
     };
@@ -367,7 +402,7 @@ pub async fn download_magnet(
             done.store(true, Ordering::Relaxed);
             let _ = poll.await;
             return Err(Error::Download(
-                "torrent: no transfer progress in {stall_secs}s (dead swarm / unreachable peers)".into(),
+                "torrent: too slow (under 70% after 120s or stalled 90s); falling back".into(),
             ));
         }
     };
@@ -394,10 +429,25 @@ pub async fn download_magnet(
 }
 
 /// Token set for containment matching (mirrors textmatch, without the
-/// private helper).
+/// private helper). Bracketed extras ("[Remastered 2011]", "(2018)") are
+/// stripped from file names first so they don't dilute the score.
 fn name_containment(label: &str, file_name: &str) -> f64 {
+    let clean = |s: &str| -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut depth = 0usize;
+        for c in s.chars() {
+            match c {
+                '[' | '(' | '{' => depth += 1,
+                ']' | ')' | '}' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    };
     let toks = |s: &str| -> std::collections::HashSet<String> {
-        s.to_lowercase()
+        clean(s)
+            .to_lowercase()
             .split(|c: char| !c.is_alphanumeric())
             .filter(|t| t.len() >= 2 && !t.chars().all(|c| c.is_ascii_digit()))
             .map(|t| t.to_string())
