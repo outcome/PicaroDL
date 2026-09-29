@@ -28,21 +28,29 @@ pub fn is_challenge(body: &str) -> bool {
 async fn direct_get(client: &reqwest::Client, url: &str, referer: &str) -> Result<String, String> {
     let mut req = client
         .get(url)
-        .header(reqwest::header::USER_AGENT, UA)
         .header(reqwest::header::REFERER, referer)
         .header(
             reqwest::header::ACCEPT,
             "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         )
         .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9");
-    // Android-friendly bypass: a `cf_clearance` cookie harvested by a WebView (or
-    // any browser) can be injected here so the normal reqwest path passes
-    // Cloudflare on-device, with no Docker/FlareSolverr needed.
-    if let Ok(cookie) = std::env::var("PICARO_CF_COOKIE") {
+    let mut ua = UA.to_string();
+    // Solved sessions take precedence: their cookie is UA-bound, so the
+    // request must use the SAME user agent the browser had.
+    if let Some(session) = solved_session_for(url) {
+        req = req.header(reqwest::header::COOKIE, &session.cookies);
+        if !session.user_agent.is_empty() {
+            ua = session.user_agent;
+        }
+    } else if let Ok(cookie) = std::env::var("PICARO_CF_COOKIE") {
+        // Android-friendly bypass: a `cf_clearance` cookie harvested by a
+        // WebView (or any browser) can be injected here so the normal
+        // reqwest path passes Cloudflare on-device.
         if !cookie.trim().is_empty() {
             req = req.header(reqwest::header::COOKIE, cookie);
         }
     }
+    req = req.header(reqwest::header::USER_AGENT, ua);
     let resp = req
         .send()
         .await
@@ -56,6 +64,78 @@ async fn direct_get(client: &reqwest::Client, url: &str, referer: &str) -> Resul
         Ok(body)
     } else {
         Err(format!("cf_http HTTP {status}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Solved-session store: config/cf-cookies.json
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SolvedSession {
+    cookies: String,
+    #[serde(default)]
+    user_agent: String,
+    #[serde(default)]
+    solved_at: u64,
+}
+
+fn cookies_store_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("PICARO_CF_COOKIES") {
+        return std::path::PathBuf::from(p);
+    }
+    std::path::PathBuf::from("config/cf-cookies.json")
+}
+
+fn host_of(url: &str) -> String {
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// The stored session for `url`'s host, when one exists.
+fn solved_session_for(url: &str) -> Option<SolvedSession> {
+    let host = host_of(url);
+    let store: std::collections::HashMap<String, SolvedSession> = std::fs::read_to_string(
+        cookies_store_path(),
+    )
+    .ok()
+    .and_then(|s| serde_json::from_str(&s).ok())?;
+    // Exact host or a registered parent domain (www.flacmania.biz ->
+    // flacmania.biz).
+    if let Some(s) = store.get(&host) {
+        return Some(s.clone());
+    }
+    store
+        .iter()
+        .find(|(k, _)| host == *k.as_str() || host.ends_with(&format!(".{k}")))
+        .map(|(_, v)| v.clone())
+}
+
+#[cfg(feature = "cf-webview")]
+fn persist_solved_session(session: &picaro_webview::CfSession) {
+    let path = cookies_store_path();
+    let mut store: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    store.insert(
+        session.host.clone(),
+        serde_json::json!({
+            "cookies": session.cookies,
+            "user_agent": session.user_agent,
+            "solved_at": session.solved_at,
+        }),
+    );
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&store) {
+        let _ = std::fs::write(&path, s);
     }
 }
 
@@ -124,6 +204,32 @@ pub async fn fetch(client: &reqwest::Client, url: &str, referer: &str) -> Result
     if let Ok(body) = direct_get(client, url, referer).await {
         if !is_challenge(&body) {
             return Ok(body);
+        }
+    }
+
+    #[cfg(feature = "cf-webview")]
+    {
+        // Built-in solver: drive the system Chromium once, persist the
+        // session, retry. Later fetches reuse the stored cookies with no
+        // browser involved at all.
+        if std::env::var("PICARO_NO_WEBVIEW").is_err() {
+            let timeout = std::env::var("PICARO_CF_SOLVE_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(60u64);
+            match picaro_webview::solve_cf(url, timeout).await {
+                Ok(session) => {
+                    persist_solved_session(&session);
+                    if let Ok(body) = direct_get(client, url, referer).await {
+                        if !is_challenge(&body) {
+                            return Ok(body);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("cf_http: webview solver failed for {url}: {e}");
+                }
+            }
         }
     }
 

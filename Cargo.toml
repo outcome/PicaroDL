@@ -1,13 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/picaro-core",
-    "crates/picaro-utils",
-    "crates/picaro-downloader",
-    "crates/picaro-tagging",
-    "crates/picaro-modules",
-    "crates/picaro-tui",
-    "crates/picaro",
+"crates/picaro-core",
+"crates/picaro-utils",
+"crates/picaro-downloader",
+"crates/picaro-tagging",
+"crates/picaro-modules",
+"crates/picaro-tui",
+"crates/picaro-webview",
+"crates/picaro",
 ]
 
 [workspace.package]
