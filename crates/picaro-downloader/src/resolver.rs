@@ -75,7 +75,7 @@ impl Resolver {
             .unwrap_or(0.5)
             .clamp(0.0, 1.0);
         let allow_mixed_sources = g.get_bool_or("resolver", "allow_mixed_sources", false);
-        let allow_mixed_quality = g.get_bool_or("resolver", "allow_mixed_quality", false);
+        let allow_mixed_quality = g.get_bool_or("resolver", "allow_mixed_quality", true);
         let allow = g
             .get("resolver", "providers")
             .and_then(|v| v.as_array())
