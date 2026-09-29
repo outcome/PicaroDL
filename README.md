@@ -297,43 +297,41 @@ none of it is ever committed. There's no telemetry and nothing phones home.
 The code is plain Rust and `reqwest`, so it cross-compiles to Android; the
 intended UI is Slint. Sources behind Cloudflare are skipped by default. If you
 want them, a WebView can solve the challenge once and hand the cookie to
-PicaroDL through the `PICARO_CF_COOKIE` environment variable; `PICARO_FLARESOLVERR`
-can point at an optional remote solver. Neither is required.
+PicaroDL; `PICARO_FLARESOLVERR` can point at an optional remote solver (plain
+HTTP, so it can live on any machine on your LAN). Neither is required.
 
-### Cloudflare-gated sources (optional webview solver)
+### Cloudflare-gated sources
 
-Roughly 15 FLAC sites we tested are otherwise perfect — direct downloads,
-regex-friendly — but sit behind Cloudflare's JS challenge. Building with
+Some FLAC sites are otherwise perfect — direct downloads, regex-friendly — but
+sit behind Cloudflare's JS challenge. PicaroDL carries no browser, but the
+clearance is just data: solve once anywhere, and every platform can use it.
 
-```bash
-cargo build --release --features webview
+`config/cf-cookies.json` holds solved sessions per domain:
+
+```json
+{
+  "flacmania.biz": {
+    "cookies": "cf_clearance=...; other=...",
+    "user_agent": "Mozilla/5.0 ... (must match the browser that solved it)",
+    "solved_at": 1790694712
+  }
+}
 ```
 
-adds a built-in solver: the first time a fetch hits a challenge, PicaroDL
-drives your system Chromium (Brave/Chrome/Edge, whichever it finds; override
-with `PICARO_BROWSER`) in a **real browser window parked off-screen** —
-headless is fingerprinted and never clears — harvests the `cf_clearance`
-cookie, persists it to `config/cf-cookies.json`, and every later fetch is
-plain `reqwest` with no browser involved. Verified: flacmania.biz cleared in
-22s, then fetched at HTTP 200 with plain curl. A standalone helper does the
-same from scripts:
+- `PICARO_CF_COOKIE` injects a raw `Cookie` header as a one-off alternative.
+- `PICARO_CF_COOKIES` points at a custom cookie-store path.
+- `PICARO_FLARESOLVERR` delegates solving to a [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr)
+  instance (it bundles a browser, so the device running it needs a display or
+  xvfb — that's why it stays a separate service).
 
-```bash
-./target/release/picaro-cf-solve https://flacmania.biz/ --save config/cf-cookies.json
-```
-
-Platform support for gated sources:
-
-| Platform | Path |
+| Platform | Path to gated sources |
 |---|---|
-| Windows / Linux desktop | built-in solver (`--features webview`) |
+| Windows / Linux desktop | FlareSolverr locally, or solve in your browser and copy the cookie |
 | Android (CLI) | copy a solved `config/cf-cookies.json` from your PC |
-| Switch homebrew | no webview exists — copy `cf-cookies.json`, or point `PICARO_FLARESOLVERR` at a solver on your LAN (plain HTTP) |
+| Switch homebrew | copy `cf-cookies.json`, or use FlareSolverr over LAN |
 
-Knobs: `PICARO_BROWSER` (executable path), `PICARO_CF_HEADLESS` (force
-headless — will likely fail the challenge), `PICARO_NO_WEBVIEW` (disable
-auto-solving), `PICARO_CF_COOKIES` (cookie store path),
-`PICARO_CF_SOLVE_TIMEOUT` (seconds, default 60).
+Cookies are bound to the solving IP + user agent; if the site still blocks,
+re-solve from the same network.
 
 ## Disclaimer
 

@@ -13,12 +13,6 @@ default = []
 # (pulls in boa_engine), requires a `browsers.json` file at runtime, and does not
 # solve Cloudflare "managed" challenges in practice. Prefer PICARO_FLARESOLVERR.
 cloudscraper = ["dep:cloudscraper"]
-# Built-in headless-Chromium Cloudflare solver (picaro-webview): on a
-# challenge, drive the system browser once, persist the session to
-# config/cf-cookies.json, and reuse it from plain reqwest afterwards.
-# Desktop-only (needs a Chromium on the machine); OFF by default so
-# Android/Switch builds never compile the browser plumbing.
-cf-webview = ["dep:picaro-webview"]
 
 [dependencies]
 picaro-core = { path = "../picaro-core" }
@@ -71,4 +65,3 @@ markup5ever = "0.14"
 # NOTE: crates.io has no `cloudscraper` package (404). The closest maintained
 # crate is `cloudscraper-rs`; alias it so the import path stays `cloudscraper`.
 cloudscraper = { package = "cloudscraper-rs", version = "0.2.0", optional = true }
-picaro-webview = { path = "../picaro-webview", optional = true }

@@ -116,29 +116,6 @@ fn solved_session_for(url: &str) -> Option<SolvedSession> {
         .map(|(_, v)| v.clone())
 }
 
-#[cfg(feature = "cf-webview")]
-fn persist_solved_session(session: &picaro_webview::CfSession) {
-    let path = cookies_store_path();
-    let mut store: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    store.insert(
-        session.host.clone(),
-        serde_json::json!({
-            "cookies": session.cookies,
-            "user_agent": session.user_agent,
-            "solved_at": session.solved_at,
-        }),
-    );
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(s) = serde_json::to_string_pretty(&store) {
-        let _ = std::fs::write(&path, s);
-    }
-}
-
 #[cfg(feature = "cloudscraper")]
 async fn via_cloudscraper(url: &str) -> Result<String, String> {
     let url = url.to_string();
@@ -204,32 +181,6 @@ pub async fn fetch(client: &reqwest::Client, url: &str, referer: &str) -> Result
     if let Ok(body) = direct_get(client, url, referer).await {
         if !is_challenge(&body) {
             return Ok(body);
-        }
-    }
-
-    #[cfg(feature = "cf-webview")]
-    {
-        // Built-in solver: drive the system Chromium once, persist the
-        // session, retry. Later fetches reuse the stored cookies with no
-        // browser involved at all.
-        if std::env::var("PICARO_NO_WEBVIEW").is_err() {
-            let timeout = std::env::var("PICARO_CF_SOLVE_TIMEOUT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(60u64);
-            match picaro_webview::solve_cf(url, timeout).await {
-                Ok(session) => {
-                    persist_solved_session(&session);
-                    if let Ok(body) = direct_get(client, url, referer).await {
-                        if !is_challenge(&body) {
-                            return Ok(body);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("cf_http: webview solver failed for {url}: {e}");
-                }
-            }
         }
     }
 
