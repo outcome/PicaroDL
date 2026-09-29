@@ -280,9 +280,13 @@ impl picaro_utils::module::ModuleInterface for Mod {
         let q = query.split_whitespace().collect::<Vec<_>>().join("-");
         let html = fetch_page(&self.client, &format!("{BASE}/search/{q}")).await?;
         let max = limit.clamp(1, 50) as usize;
+        // Each handler link is followed (one HTTP GET each) to learn the
+        // real song name, so cap the resolution work regardless of the
+        // caller's limit.
+        let fetch_cap = max.min(10);
         let mut out = Vec::new();
         for handler in parse_handler_links(&html) {
-            if out.len() >= max {
+            if out.len() >= fetch_cap {
                 break;
             }
             // The handler URL contains the QUERY, not the song name.

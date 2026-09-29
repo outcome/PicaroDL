@@ -134,8 +134,18 @@ fn collect_audio_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
+            // macOS archive junk (`__MACOSX`) never holds real audio.
+            if path.file_name().and_then(|f| f.to_str()) == Some("__MACOSX") {
+                continue;
+            }
             collect_audio_files(&path, out);
         } else if is_audio_ext(&path) {
+            // AppleDouble resource forks (`._track.mp3`) look like audio
+            // but are 256-byte metadata stubs.
+            let name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+            if name.starts_with("._") {
+                continue;
+            }
             out.push(path);
         }
     }
@@ -162,6 +172,20 @@ async fn extract_zip(archive: &Path, out: &Path) -> Result<()> {
                 Some(p) => p.to_path_buf(),
                 None => continue,
             };
+            // macOS zip metadata: `__MACOSX/` AppleDouble stubs and
+            // `._name` resource-fork files are not real content, and the
+            // stubs carry audio-looking extensions (._track.mp3).
+            let name = rel
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or_default();
+            if name.starts_with("._")
+                || rel
+                    .components()
+                    .any(|c| c.as_os_str() == "__MACOSX")
+            {
+                continue;
+            }
             let target = out.join(&rel);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).ok();

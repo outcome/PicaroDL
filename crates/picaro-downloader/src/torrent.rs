@@ -33,6 +33,13 @@ const EXTRA_TRACKERS: &[&str] = &[
  "udp://tracker.moeking.me:6969/announce",
  "udp://ipv4.tracker.harry.lu:80/announce",
  "udp://explodie.org:6969/announce",
+ // HTTP trackers: on networks where UDP is blocked/reset (hotel wifi,
+ // campus NAT), DHT and UDP trackers never yield peers; these keep
+ // magnet downloads alive.
+ "http://open.acgnxtracker.com:80/announce",
+ "http://tracker.bt4g.com:2094/announce",
+ "http://tracker.dler.org:6969/announce",
+ "http://pubt.net:6969/announce",
 ];
 
 use picaro_utils::error::{Error, Result};

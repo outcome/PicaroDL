@@ -136,7 +136,15 @@ pub async fn download_to_path(
     let mut resp = req.send().await?.error_for_status()?;
     let total = resp.content_length().unwrap_or(0);
     progress.report(0, total);
-    let mut file = fs::File::create(dest).await?;
+    // Download to "<dest>.part" and rename on completion, so an
+    // interrupted transfer never leaves a plausible-looking partial at
+    // the final name (the skip-check would then treat it as done).
+    let part = {
+        let mut p = dest.as_os_str().to_os_string();
+        p.push(".part");
+        PathBuf::from(p)
+    };
+    let mut file = fs::File::create(&part).await?;
     let mut bytes: u64 = 0;
     while let Some(chunk) = resp.chunk().await? {
         file.write_all(&chunk).await?;
@@ -145,6 +153,7 @@ pub async fn download_to_path(
         progress.report(bytes, total);
     }
     file.flush().await?;
+    fs::rename(&part, dest).await?;
     if let Some(bar) = &progress.bar {
         if total == 0 {
             bar.set_position(bytes);

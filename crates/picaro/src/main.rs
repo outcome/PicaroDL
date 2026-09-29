@@ -136,7 +136,12 @@ fn build_registry() -> ModuleRegistry {
 }
 
 async fn run_cli(cli: Cli) -> anyhow::Result<()> {
-    init_logging();
+    // The TUI owns the whole screen: tracing's stderr lines would paint
+    // over the interface (the TUI shows logs in its Logs tab instead).
+    // Keep them for every other (CLI) command.
+    if !matches!(cli.command, Some(Command::Tui) | None) {
+        init_logging();
+    }
     let config_dir = cli
         .config
         .clone()

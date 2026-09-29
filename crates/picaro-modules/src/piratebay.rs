@@ -82,12 +82,20 @@ fn magnet_for(hash: &str, name: &str) -> String {
 }
 
 fn name_of(magnet: &str) -> String {
-    magnet
+    let raw = magnet
         .split("&dn=")
         .nth(1)
         .and_then(|s| s.split('&').next())
-        .map(|s| s.replace('+', " "))
-        .unwrap_or_else(|| "Pirate Bay release".to_string())
+        .and_then(|s| {
+            // dn is percent-encoded by magnet_for; decode it so album
+            // folders aren't named "Radiohead%20%2D%20In%20Rainbows".
+            percent_encoding::percent_decode_str(s)
+                .decode_utf8()
+                .ok()
+                .map(|s| s.replace('+', " "))
+        })
+        .unwrap_or_else(|| "Pirate Bay release".to_string());
+    raw.trim().to_string()
 }
 
 #[async_trait]

@@ -744,7 +744,11 @@ impl SoundCloudModule {
             let pref = Self::stream_preference(codec, is_hls);
             candidates.push((quality, pref, url, codec, is_hls, preset));
         }
-        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        // The downloader fetches a single URL: an HLS choice resolves to
+        // an .m3u8 playlist (kilobytes of text), not audio. Prefer
+        // progressive always; within each class, bitrate then codec
+        // preference decides. HLS is only a last resort.
+        candidates.sort_by(|a, b| a.4.cmp(&b.4).then(b.0.cmp(&a.0)).then(b.1.cmp(&a.1)));
         candidates
             .into_iter()
             .next()

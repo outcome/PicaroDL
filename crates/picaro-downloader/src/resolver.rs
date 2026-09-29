@@ -299,21 +299,50 @@ impl Resolver {
             let q = query.to_string();
             let picaro = self.picaro.clone();
  let to = if tier == QualityTier::Lossless {
- self.timeout_lossless
- } else {
- self.timeout
- };
+  self.timeout_lossless
+  } else {
+  self.timeout
+  };
+            // Soulseek is P2P: its own search waits ~15s for peers to
+            // answer, so the 4s probe would kill it before any results.
+            let to = if service == "soulseek" {
+                to.max(std::time::Duration::from_secs(25))
+            } else {
+                to
+            };
             let min_match = self.min_match;
             futs.push(async move {
                 let start = Instant::now();
                 let res = tokio::time::timeout(to, async {
                     let m = picaro.load_module(&service).await.ok()?;
-                    let results = m.search(DownloadType::track, &q, None, 8).await.ok()?;
+                    // 25, not 8: weak-search modules (blogspot labels,
+                    // DLE recency sidebars) push real matches deep into
+                    // the result list; search returns metadata only, so
+                    // a full page is cheap.
+                    let results = m.search(DownloadType::track, &q, None, 25).await.ok()?;
                     let mut best: Option<(f64, SearchResult)> = None;
                     for r in results {
                         let s = score_result(&q, &r);
                         if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
                             best = Some((s, r));
+                        }
+                    }
+                    // Many sites phrase-match the " - " separator and
+                    // return nothing for "artist - title" queries; retry
+                    // once with plain words (scored against the original
+                    // query) before giving up on this service.
+                    let weak = best
+                        .as_ref()
+                        .map_or(true, |(s, _)| *s < min_match);
+                    if weak && q.contains(" - ") {
+                        let alt = q.replace(" - ", " ");
+                        if let Ok(more) = m.search(DownloadType::track, &alt, None, 25).await {
+                            for r in more {
+                                let s = score_result(&q, &r);
+                                if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
+                                    best = Some((s, r));
+                                }
+                            }
                         }
                     }
                     match best {
