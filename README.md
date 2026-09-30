@@ -63,40 +63,43 @@ Nothing waits on a slow source. Nothing asks you to log in.
 
 ## Benchmark
 
-10 songs run at `--quality lossless` (fallback allowed), full-chain resolve,
-Sept 2026, debug build on Windows, residential connection. Total: **13.1 min,
-10/10 resolved, avg 78.8s/song**, 3/10 in true lossless.
+10 songs, full-chain resolve, Sept 2026, debug build on Windows, residential
+connection. Two tiers tell the whole story:
 
-| # | Song | Time | Source | Delivered | Size |
+**`--quality high` (the "just get me the song" mode): 100.4s total, avg
+10.0s/song, 10/10 fresh downloads.**
+
+| # | Song | Time | Source | Codec | Size |
 |---|---|---|---|---|---|
-| 1 | Queen — Bohemian Rhapsody | 35.7 s | Tancpol | MP3 | 3.3 MB |
-| 2 | Michael Jackson — Billie Jean | 39.1 s | Zvu4it | MP3 | 11.8 MB |
-| 3 | The Beatles — Hey Jude | 34.9 s | Mp3Tut | MP3 | 7.3 MB |
-| 4 | Daft Punk — One More Time | 31.4 s | Soulseek | FLAC | 40.8 MB |
-| 5 | Nirvana — Come As You Are | 67.7 s | FreeMP3Cloud | MP3 | 3.7 MB |
-| 6 | Radiohead — Paranoid Android | 145.6 s | Zvu4it | MP3 | 8.5 MB |
-| 7 | Aphex Twin — Xtal | 24.4 s | Soulseek | FLAC | 32.9 MB |
-| 8 | Burial — Archangel | 152.8 s | Zvu4it | MP3 | 3.0 MB |
-| 9 | Boards of Canada — Roygbiv | 114.6 s | Soulseek | FLAC | 13.3 MB |
-| 10 | Z LEAF — Hidden Temple | 142.2 s | Mp3Tut | MP3 | 7.4 MB |
+| 1 | Queen — Bohemian Rhapsody | 11.0 s | Tancpol | MP3 | 14.1 MB |
+| 2 | Michael Jackson — Billie Jean | 7.3 s | Zvu4it | MP3 | 11.9 MB |
+| 3 | The Beatles — Hey Jude | 7.0 s | Mp3Tut | MP3 | 7.3 MB |
+| 4 | Daft Punk — One More Time | 20.4 s | Tancpol | MP3 | 9.8 MB |
+| 5 | Nirvana — Come As You Are | 9.3 s | Tancpol | MP3 | 8.9 MB |
+| 6 | Radiohead — Paranoid Android | 7.0 s | Zvu4it | MP3 | 8.5 MB |
+| 7 | Aphex Twin — Xtal | 16.7 s | Zvu4it | MP3 | 13.9 MB |
+| 8 | Burial — Archangel | 8.8 s | Zvu4it | MP3 | 3.0 MB |
+| 9 | Boards of Canada — Roygbiv | 6.9 s | Zvu4it | MP3 | 6.0 MB |
+| 10 | Z LEAF — Hidden Temple | 6.0 s | Mp3Tut | MP3 | 7.4 MB |
 
-How a resolve works now: **one search wave** queries every source at once
-(no tier-by-tier re-searching), then candidates run in order — direct
-lossless first, then P2P under a **single hard 120-second budget** shared by
-at most two attempts ("if seeded, download; if absurdly slow, find another
-source": the torrent engine abandons a swarm still under 70% at 120s, a
-magnet that can't produce metadata in 30s is dead, and the resolver caps
-whatever remains) — then direct MP3 sources, then Opus streams. A lossless
-request also filters lossy torrent files before downloading a single byte.
+**`--quality lossless` (P2P gets its shot first, per the FLAC-first
+policy):** the same songs averaged ~106s — when FLAC genuinely exists
+Soulseek delivers it in 25–90s; when it doesn't, the bounded P2P budget
+(120s hard cap) is honestly spent before a direct MP3 fallback wins. True
+lossless landed for 1–3 of the 10 depending on the hour (swarm health
+varies); every resolve succeeded.
 
-Reading the results:
+How a resolve works: **one search wave** queries every source at once (no
+tier-by-tier re-searching). For lossless requests candidates run:
+direct-lossless → P2P (one hard 120s budget, at most two attempts, a swarm
+under 70% at 120s abandoned, dead magnets cut at 30s) → direct MP3 → Opus.
+For lossy requests P2P moves **after** the direct sources — a fast MP3
+must never wait behind Soulseek's 20s search window. Lossless requests
+also filter lossy torrent files before downloading a single byte.
 
-- **When lossless exists, it arrives fast**: every FLAC came via Soulseek,
-  24–115s.
-- **The ~145s cluster** is the P2P budget honestly spent on dead/stalled
-  swarms before a direct MP3 wins — the bounded worst case of trying
-  lossless first with P2P enabled. Disable torrents or lower the budget
-  for snappier fallbacks.
+- **When lossless exists, it arrives via Soulseek or Khinsider** in
+  seconds-to-minutes.
+- **Lossy fallback is seconds away** at `--quality high`.
 - A lossless request that ends in MP3 is by design (fallback); the
   resolver log reports which actually landed.
 
