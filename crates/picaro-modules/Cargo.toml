@@ -6,7 +6,10 @@ license.workspace = true
 description = "Built-in service modules: Qobuz, Tidal, Deezer, YouTube, SoundCloud, Spotify, Apple, Beatport, Beatsource, Amazon, lrclib, musixmatch"
 
 [features]
-default = []
+# Chrome TLS emulation on by default: a plain desktop `cargo build` gets
+# the khinsider module with no extra flags. Switch/Android (or toolchains
+# without cmake+nasm+libclang) build with --no-default-features.
+default = ["cf-impersonate"]
 # Optional Cloudflare challenge solver used by `cf_http`. The upstream crate is
 # published as `cloudscraper-rs` (there is no `cloudscraper` crate on crates.io),
 # so it is aliased here to `cloudscraper`. It is OFF by default: it is heavy

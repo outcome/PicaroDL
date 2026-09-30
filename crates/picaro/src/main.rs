@@ -1,7 +1,15 @@
 //! PicaroDL - CLI / TUI entry point.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Absolute path without Windows' `\\?\` verbatim prefix, so downstream
+/// parsers (and users) see a normal path.
+fn display_path(p: &std::path::Path) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    std::path::PathBuf::from(s.trim_start_matches(r"\\?\"))
+}
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -104,6 +112,9 @@ enum Command {
         /// Only resolve (print the winning source) without downloading.
         #[arg(long)]
         resolve_only: bool,
+        /// Machine output (with --resolve-only): one JSON object.
+        #[arg(long)]
+        json: bool,
         /// Restrict to a single provider (e.g. flacmusic).
         #[arg(long)]
         only: Option<String>,
@@ -112,8 +123,44 @@ enum Command {
     /// Query every lyrics provider for "artist - title".
     Lyrics { query: String },
 
-    /// Look up cover art for "artist - title" and print the chosen source/URL.
-    Cover { query: String },
+    /// Look up cover art for "artist - title" (or --artist/--album).
+    Cover {
+        query: Option<String>,
+        /// Explicit artist (overrides query parsing).
+        #[arg(long)]
+        artist: Option<String>,
+        /// Explicit album name (album-first lookup: fetch the ALBUM's cover).
+        #[arg(long)]
+        album: Option<String>,
+        /// Download the image to this file (or directory) instead of
+        /// printing the URL.
+        #[arg(long, visible_alias = "save")]
+        out: Option<std::path::PathBuf>,
+        /// Machine output: one JSON object.
+        #[arg(long)]
+        json: bool,
+        /// Skip sources that can't meet this size (pixels, square assumed).
+        #[arg(long)]
+        min_size: Option<u32>,
+    },
+
+    /// Download one track from an album by disc/position ("Complete album").
+    GetTrack {
+        /// "artist - album title" to resolve the release.
+        #[arg(long)]
+        album: String,
+        #[arg(long, default_value = "1")]
+        disc: u32,
+        /// 1-based position on the disc.
+        #[arg(long)]
+        pos: u32,
+        /// Target quality: lossless|high|medium|low.
+        #[arg(short, long, default_value = "high")]
+        quality: String,
+        /// Restrict to a single provider.
+        #[arg(long)]
+        only: Option<String>,
+    },
 
     /// Benchmark sources against a fixed query set (timing + result counts).
     Benchmark {
@@ -263,21 +310,239 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 println!("{:<8}  {:<48}  {}{}", r.result_id, title, artists, dur);
             }
         }
-        Command::Cover { query } => {
-            let (artist, title) = match query.find(" - ") {
-                Some(i) => (
-                    query[..i].trim().to_string(),
-                    query[i + 3..].trim().to_string(),
-                ),
-                None => (String::new(), query.trim().to_string()),
+        Command::Cover {
+            query,
+            artist,
+            album,
+            out,
+            json,
+            min_size,
+        } => {
+            // Artist/album flags win over query-string parsing.
+            let (artist, title) = match (artist, album) {
+                (Some(a), Some(al)) => (a, al),
+                (Some(a), None) => {
+                    let q = query.clone().unwrap_or_default();
+                    (a, q.trim().to_string())
+                }
+                (None, Some(al)) => {
+                    let q = query.clone().unwrap_or_default();
+                    (q.trim().to_string(), al)
+                }
+                (None, None) => {
+                    let q = query.unwrap_or_default();
+                    match q.find(" - ") {
+                        Some(i) => (
+                            q[..i].trim().to_string(),
+                            q[i + 3..].trim().to_string(),
+                        ),
+                        None => (String::new(), q.trim().to_string()),
+                    }
+                }
             };
             let client = picaro_utils::http::build_raw_client();
-            match picaro_utils::metadata_fill::lookup_cover(&client, &artist, &title).await {
-                Some(h) => println!(
+            let mut candidates = picaro_utils::metadata_fill::lookup_cover_art(
+                &client,
+                &artist,
+                &title,
+            )
+            .await;
+            if let Some(min) = min_size {
+                // Known-dimension candidates below the floor are out;
+                // unknown-dimension ones stay as last resort.
+                let has_small = candidates.iter().any(|c| c.width.map_or(false, |w| w < min));
+                let mut filtered: Vec<_> = candidates
+                    .iter()
+                    .filter(|c| c.width.map_or(true, |w| w >= min))
+                    .cloned()
+                    .collect();
+                if filtered.is_empty() {
+                    // keep unknowns as fallback rather than nothing
+                    candidates.retain(|c| c.width.is_none());
+                } else {
+                    candidates = filtered;
+                    filtered = Vec::new();
+                }
+                let _ = has_small;
+            }
+            let Some(hit) = candidates.first() else {
+                if json {
+                    println!("{{\"error\":\"no cover found\"}}");
+                } else {
+                    println!("MISS: no cover found for '{artist} - {title}'");
+                }
+                std::process::exit(1);
+            };
+            if let Some(out_path) = out {
+                // Download the image bytes and write to disk.
+                let resp = client.get(&hit.url).send().await;
+                let bytes = match resp {
+                    Ok(r) if r.status().is_success() => r.bytes().await.ok(),
+                    _ => None,
+                };
+                let Some(bytes) = bytes.filter(|b| !b.is_empty()) else {
+                    if json {
+                        println!("{{\"error\":\"download failed\"}}");
+                    } else {
+                        println!("MISS: cover download failed ({})", hit.url);
+                    }
+                    std::process::exit(1);
+                };
+                let ext = match hit.format.as_deref() {
+                    Some("png") => "png",
+                    _ => "jpg",
+                };
+                let path = if out_path.is_dir() {
+                    let safe = format!("{} - {}.{}", artist, title, ext)
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() || c == ' ' || c == '-' || c == '.' {
+                            c
+                        } else {
+                            '_'
+                        })
+                        .collect::<String>();
+                    out_path.join(safe)
+                } else if out_path.extension().is_none() {
+                    out_path.with_extension(ext)
+                } else {
+                    out_path.clone()
+                };
+                let abs = std::fs::canonicalize(path.parent().unwrap_or(std::path::Path::new(".")))
+                    .unwrap_or_default()
+                    .join(path.file_name().unwrap_or_default());
+                if let Err(e) = std::fs::write(&path, &bytes) {
+                    println!("error: cover write failed: {e}");
+                    std::process::exit(1);
+                }
+                if json {
+                    println!(
+                        "{{\"path\":{}, \"url\":{}, \"source\":\"{}\", \"width\":{}, \"height\":{}, \"format\":\"{}\"}}",
+                        serde_json::to_string(&abs.to_string_lossy()).unwrap(),
+                        serde_json::to_string(&hit.url).unwrap(),
+                        hit.source,
+                        hit.width.map(|w| w.to_string()).unwrap_or("null".into()),
+                        hit.height.map(|h| h.to_string()).unwrap_or("null".into()),
+                        hit.format.as_deref().unwrap_or("jpeg"),
+                    );
+                } else {
+                    println!("Downloaded: {}", display_path(&abs).display());
+                }
+                std::process::exit(0);
+            }
+            if json {
+                println!(
+                    "{{\"url\":{}, \"source\":\"{}\", \"width\":{}, \"height\":{}, \"format\":\"{}\"}}",
+                    serde_json::to_string(&hit.url).unwrap(),
+                    hit.source,
+                    hit.width.map(|w| w.to_string()).unwrap_or("null".into()),
+                    hit.height.map(|h| h.to_string()).unwrap_or("null".into()),
+                    hit.format.as_deref().unwrap_or("jpeg"),
+                );
+            } else {
+                println!(
                     "{} | album='{}' artist='{}' | {}",
-                    h.source, h.album, h.artist, h.url
-                ),
-                None => println!("NO COVER"),
+                    hit.source, hit.album, hit.artist, hit.url
+                );
+            }
+            std::process::exit(0);
+        }
+        Command::GetTrack {
+            album,
+            disc,
+            pos,
+            quality,
+            only,
+        } => {
+            let tier = picaro_utils::quality::QualityTier::parse(&quality).ok_or_else(|| {
+                anyhow::anyhow!("invalid quality '{quality}' (lossless|high|medium|low)")
+            })?;
+            let mut resolver = picaro_downloader::resolver::Resolver::new(
+                picaro.clone(),
+                picaro_core::loader::config_dir().join("providers.json"),
+            );
+            resolver.set_only(only);
+            // 1. Resolve the release.
+            let r = match resolver.resolve(&album, tier).await {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            // 2. Enumerate its tracks.
+            let module = match picaro.load_module(&r.service).await {
+                Ok(m) => m,
+                Err(e) => {
+                    println!("error: load {service}: {e}", service = r.service);
+                    std::process::exit(1);
+                }
+            };
+            let info = match module
+                .get_album_info(&r.result_id, HashMap::new())
+                .await
+            {
+                Ok(i) => i,
+                Err(e) => {
+                    println!("error: album info from {}: {e}", r.service);
+                    std::process::exit(1);
+                }
+            };
+            // 3. Pick the track at disc/pos.
+            let disc_tracks: Vec<&picaro_utils::models::TrackRef> = info
+                .tracks
+                .iter()
+                .filter(|t| match t {
+                    picaro_utils::models::TrackRef::Full(f) => {
+                        f.tags.disc_number.unwrap_or(1) == disc
+                    }
+                    picaro_utils::models::TrackRef::Id(_) => disc == 1,
+                })
+                .collect();
+            let Some(track) = disc_tracks.get((pos.max(1) - 1) as usize) else {
+                println!(
+                    "error: {} has {} track(s) on disc {disc} (position {pos} requested)",
+                    info.name,
+                    disc_tracks.len()
+                );
+                std::process::exit(1);
+            };
+            let (track_id, track_name) = match track {
+                picaro_utils::models::TrackRef::Full(f) => {
+                    (f.id.clone().unwrap_or_default(), f.name.clone())
+                }
+                picaro_utils::models::TrackRef::Id(id) => (id.clone(), String::new()),
+            };
+            let track_name = if track_name.is_empty() {
+                format!("{} track {pos}", info.name)
+            } else {
+                track_name
+            };
+            // 4. Download it (archive containers pick the named file).
+            let downloader = make_downloader(picaro.clone(), &cli);
+            spawn_progress_printer(&downloader);
+            let mut data = HashMap::new();
+            data.insert(
+                "__track_name__".to_string(),
+                serde_json::Value::String(track_name.clone()),
+            );
+            if !info.artist.is_empty() {
+                data.insert(
+                    "__artist__".to_string(),
+                    serde_json::Value::String(info.artist.clone()),
+                );
+            }
+            match downloader
+                .download_track_with_data(&r.service, &track_id, data)
+                .await
+            {
+                Ok(p) => {
+                    let abs = std::fs::canonicalize(&p).unwrap_or(p.clone());
+                    println!("Downloaded: {}", display_path(&abs).display());
+                }
+                Err(e) => {
+                    println!("error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Command::Lyrics { query } => {
@@ -335,6 +600,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             quality,
             kind,
             resolve_only,
+            json,
             only,
         } => {
             let tier = picaro_utils::quality::QualityTier::parse(&quality).ok_or_else(|| {
@@ -355,21 +621,61 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     r.service,
                     r.result_id.split('#').next().unwrap_or(&r.result_id)
                 );
-                let files = downloader.download_album(&r.service, &r.result_id).await?;
+                let files = match downloader.download_album(&r.service, &r.result_id).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        println!("error: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                if files.is_empty() {
+                    println!("error: album produced no files from {}", r.service);
+                    std::process::exit(1);
+                }
                 for f in files {
                     println!("Downloaded: {}", f.display());
                 }
             } else if resolve_only {
                 match resolver.resolve(&query, tier).await {
-                    Ok(r) => println!("{} [{}] -> {}", r.service, r.tier.as_str(), r.result_id),
-                    Err(e) => println!("MISS: {e}"),
+                    Ok(r) => {
+                        if json {
+                            println!(
+                                "{{\"service\":{}, \"tier\":\"{}\", \"target\":{}}}",
+                                serde_json::to_string(&r.service).unwrap(),
+                                r.tier.as_str(),
+                                serde_json::to_string(&r.result_id).unwrap(),
+                            );
+                        } else {
+                            println!("{} [{}] -> {}", r.service, r.tier.as_str(), r.result_id);
+                        }
+                    }
+                    Err(e) => {
+                        if json {
+                            println!(
+                                "{{\"error\":{}}}",
+                                serde_json::to_string(&e.to_string()).unwrap()
+                            );
+                        } else {
+                            println!("MISS: {e}");
+                        }
+                        std::process::exit(1);
+                    }
                 }
             } else {
                 let downloader = make_downloader(picaro.clone(), &cli);
-                let path = resolver
+                match resolver
                     .resolve_and_download(&downloader, &query, tier)
-                    .await?;
-                println!("Downloaded: {}", path.display());
+                    .await
+                {
+                    Ok(path) => {
+                        let abs = std::fs::canonicalize(&path).unwrap_or(path);
+                        println!("Downloaded: {}", display_path(&abs).display());
+                    }
+                    Err(e) => {
+                        println!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
         }
         Command::Benchmark { service } => {

@@ -707,6 +707,116 @@ pub struct CoverHit {
     pub artist: String,
 }
 
+/// A cover candidate with everything a machine consumer wants.
+#[derive(Debug, Clone)]
+pub struct CoverArt {
+    pub source: &'static str,
+    pub url: String,
+    pub album: String,
+    pub artist: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// "jpeg" / "png" — from the URL when the bytes aren't fetched.
+    pub format: Option<String>,
+}
+
+/// Cover candidates in preference order: Deezer's 1000x1000 album art
+/// first, then Apple's (dimension-parsed from the URL), then
+/// albumart.digital (dimensions unknown until fetched). Each source gets
+/// a tight timeout so a UI button-press stays snappy.
+pub async fn lookup_cover_art(
+    client: &reqwest::Client,
+    artist: &str,
+    title: &str,
+) -> Vec<CoverArt> {
+    let query = format!("{artist} {title}").trim().to_string();
+    let mut out = Vec::new();
+    if query.is_empty() {
+        return out;
+    }
+    // Deezer first: album-oriented, 1000x1000, sub-second.
+    if let Ok(Some(hit)) =
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            deezer_lookup_best(client, &query, title, artist).await
+        })
+        .await
+    {
+        if let Some(url) = hit
+            .pointer("/album/cover_xl")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            out.push(CoverArt {
+                source: "deezer",
+                url: url.to_string(),
+                album: hit
+                    .pointer("/album/title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                artist: hit
+                    .pointer("/artist/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                width: Some(1000),
+                height: Some(1000),
+                format: Some("jpeg".to_string()),
+            });
+        }
+    }
+    // Apple / albumart.digital race in parallel: use whichever returns.
+    let apple = async {
+        itunes_album_cover(client, artist, title).await.map(|url| {
+            // iTunes URLs embed the size: /600x600bb.jpg
+            let (w, h): (Option<u32>, Option<u32>) = url
+                .split('/')
+                .rev()
+                .find_map(|seg| {
+                    let seg = seg.split("bb.").next().unwrap_or(seg);
+                    let mut parts = seg.splitn(2, 'x');
+                    let w: Option<u32> = parts.next().and_then(|s| s.parse().ok());
+                    let h: Option<u32> = parts
+                        .next()
+                        .and_then(|s| s.trim_end_matches("bb").parse().ok());
+                    w.zip(h)
+                })
+                .map(|(w, h)| (Some(w), Some(h)))
+                .unwrap_or((None, None));
+            CoverArt {
+                source: "apple",
+                url: url.clone(),
+                album: title.to_string(),
+                artist: artist.to_string(),
+                width: w,
+                height: h,
+                format: if url.ends_with(".png") { Some("png".into()) } else { Some("jpeg".into()) },
+            }
+        })
+    };    let albumart = async {
+        albumart_digital_cover(client, artist, title).await.map(|url| CoverArt {
+            source: "albumart.digital",
+            url: url.clone(),
+            album: title.to_string(),
+            artist: artist.to_string(),
+            width: None,
+            height: None,
+            format: if url.ends_with(".png") { Some("png".into()) } else { Some("jpeg".into()) },
+        })
+    };
+    let (a, b) = tokio::join!(
+        tokio::time::timeout(std::time::Duration::from_secs(6), apple),
+        tokio::time::timeout(std::time::Duration::from_secs(6), albumart)
+    );
+    if let Ok(Some(c)) = a {
+        out.push(c);
+    }
+    if let Ok(Some(c)) = b {
+        out.push(c);
+    }
+    out
+}
+
 /// Look up cover art for `artist` / `title`, reporting which source won.
 pub async fn lookup_cover(client: &reqwest::Client, artist: &str, title: &str) -> Option<CoverHit> {
     let query = format!("{artist} {title}").trim().to_string();

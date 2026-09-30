@@ -23,6 +23,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::stream::{FuturesUnordered, StreamExt};
+
+/// A boxed per-service search future (the P2P phase needs a nameable
+/// stream type to be callable from two places in the wave).
+type SearchFut = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = (String, f64, Option<Vec<(f64, SearchResult)>>)>
+            + Send,
+    >,
+>;
 use tracing::{info, warn};
 
 use picaro_core::Picaro;
@@ -567,9 +576,9 @@ impl Resolver {
                 (s, start.elapsed().as_secs_f64(), hits)
             };
             if p2p {
-                p2p_futs.push(fut);
+                p2p_futs.push(Box::pin(fut) as SearchFut);
             } else {
-                direct_futs.push(fut);
+                direct_futs.push(Box::pin(fut) as SearchFut);
             }
         }
 
@@ -614,10 +623,107 @@ impl Resolver {
             }
         }
 
-        // Group 2: P2P. Only seeded torrents survive the search filter;
-        // the torrent engine enforces the 120s / 70% rule and Soulseek
-        // caps transfers at 120s. The phase itself gives up after ~100s
-        // of wall time so a dead first swarm doesn't stack a second.
+        // Group 2 (lossless requests only): P2P right after direct
+        // lossless. For LOSSY requests P2P runs after the direct group
+        // instead - a fast, reliable MP3 must never sit behind
+        // Soulseek's 20s search window or a dead torrent attempt.
+        if tier == QualityTier::Lossless {
+            let (hit, err) = self
+                .p2p_phase(downloader, query, tier, &mut p2p_futs, (min_speed_kbps, slow_strikes, bench_minutes))
+                .await;
+            if let Some((service, p)) = hit {
+                return Ok(self.finish(&service, query, p));
+            }
+            last_err = last_err.or(err);
+        }
+
+        // Group 3: direct MP3 sources (best-scored first), then group 4:
+        // Opus stream providers.
+        let expected_direct = if tier == QualityTier::Lossless {
+            QualityTier::High
+        } else {
+            tier
+        };
+        let mut g_direct: Vec<_> = direct_hits
+            .iter()
+            .filter(|(s, _, _)| !lossless_src(s) && !is_opus_provider(s))
+            .cloned()
+            .collect::<Vec<(String, f64, SearchResult)>>();
+        g_direct.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (service, _, r) in g_direct {
+            match self
+                .attempt(downloader, query, &service, &r, expected_direct, tier)
+                .await
+            {
+                Ok(p) => return Ok(self.finish(&service, query, p)),
+                Err(e) => {
+                    self.record(&service, 5.0, false);
+                    warn!("resolver: {} matched '{}' but failed: {}", service, query, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        // Group 3.5 (lossy requests only): P2P as a fallback after the
+        // direct sources - by now the P2P searches finished long ago and
+        // the phase starts instantly.
+        if tier != QualityTier::Lossless {
+            let (hit, err) = self
+                .p2p_phase(downloader, query, tier, &mut p2p_futs, (min_speed_kbps, slow_strikes, bench_minutes))
+                .await;
+            if let Some((service, p)) = hit {
+                return Ok(self.finish(&service, query, p));
+            }
+            last_err = last_err.or(err);
+        }
+
+        let mut g_opus: Vec<_> = direct_hits
+            .iter()
+            .filter(|(s, _, _)| is_opus_provider(s))
+            .cloned()
+            .collect::<Vec<(String, f64, SearchResult)>>();
+        g_opus.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (service, _, r) in g_opus {
+            // Opus streams are the last-resort tier; quality-check them
+            // laxly (a lossless request accepting an opus fallback is
+            // the designed behavior, not a guard violation).
+            let expected = if tier == QualityTier::Lossless {
+                QualityTier::High
+            } else {
+                tier
+            };
+            match self
+                .attempt(downloader, query, &service, &r, expected, tier)
+                .await
+            {
+                Ok(p) => return Ok(self.finish(&service, query, p)),
+                Err(e) => {
+                    self.record(&service, 5.0, false);
+                    warn!("resolver: {} matched '{}' but failed: {}", service, query, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        save_scores(&self.scores_path, &self.scores);
+        Err(last_err.unwrap_or_else(|| Error::Other(format!("resolver: no source has '{query}'"))))
+    }
+
+    /// The P2P attempt phase: drain the P2P search futures (started at
+    /// t=0 of the wave), sort by seeders then score, and try at most two
+    /// candidates inside one hard 120s budget ("check for song, if
+    /// seeded, download; if absurdly slow, find another source").
+    /// Returns `Some((service, path))` on success, and the last error
+    /// otherwise. Transfers are timed for the self-benching system.
+    #[allow(clippy::type_complexity)]
+    async fn p2p_phase(
+        &mut self,
+        downloader: &Downloader,
+        query: &str,
+        tier: QualityTier,
+        p2p_futs: &mut FuturesUnordered<SearchFut>,
+        (min_speed_kbps, slow_strikes, bench_minutes): (f64, u32, u64),
+    ) -> (Option<(String, PathBuf)>, Option<Error>) {
         let mut p2p_hits: Vec<(String, f64, SearchResult)> = Vec::new();
         let p2p_deadline =
             tokio::time::Instant::from_std(Instant::now() + Duration::from_secs(30));
@@ -645,14 +751,10 @@ impl Resolver {
                 .cmp(&seeders(&a.2))
                 .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
         });
-        // P2P contract, verbatim: "check for song, if seeded, download.
-        // If it's absurdly slow (2min+), find another source." The PHASE
-        // owns one hard 120s budget shared by at most two attempts, and
-        // each attempt is capped to the remaining time — P2P can never
-        // cost more than two minutes before the resolve moves on.
         let phase_start = Instant::now();
         let phase_budget = Duration::from_secs(120);
         let mut p2p_tries = 0u32;
+        let mut last_err: Option<Error> = None;
         for (service, _, r) in &p2p_hits {
             if p2p_tries >= 2 {
                 break;
@@ -694,7 +796,7 @@ impl Resolver {
                         slow_strikes,
                         bench_minutes,
                     );
-                    return Ok(self.finish(service, query, p));
+                    return (Some((service.clone(), p)), None);
                 }
                 Err(e) => {
                     self.p2p_report(
@@ -711,63 +813,7 @@ impl Resolver {
                 }
             }
         }
-
-        // Group 3: direct MP3 sources (best-scored first), then group 4:
-        // Opus stream providers.
-        let expected_direct = if tier == QualityTier::Lossless {
-            QualityTier::High
-        } else {
-            tier
-        };
-        let mut g_direct: Vec<_> = direct_hits
-            .iter()
-            .filter(|(s, _, _)| !lossless_src(s) && !is_opus_provider(s))
-            .cloned()
-            .collect::<Vec<(String, f64, SearchResult)>>();
-        g_direct.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (service, _, r) in g_direct {
-            match self
-                .attempt(downloader, query, &service, &r, expected_direct, tier)
-                .await
-            {
-                Ok(p) => return Ok(self.finish(&service, query, p)),
-                Err(e) => {
-                    self.record(&service, 5.0, false);
-                    warn!("resolver: {} matched '{}' but failed: {}", service, query, e);
-                    last_err = Some(e);
-                }
-            }
-        }
-        let mut g_opus: Vec<_> = direct_hits
-            .iter()
-            .filter(|(s, _, _)| is_opus_provider(s))
-            .cloned()
-            .collect::<Vec<(String, f64, SearchResult)>>();
-        g_opus.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (service, _, r) in g_opus {
-            // Opus streams are the last-resort tier; quality-check them
-            // laxly (a lossless request accepting an opus fallback is
-            // the designed behavior, not a guard violation).
-            let expected = if tier == QualityTier::Lossless {
-                QualityTier::High
-            } else {
-                tier
-            };
-            match self
-                .attempt(downloader, query, &service, &r, expected, tier)
-                .await
-            {
-                Ok(p) => return Ok(self.finish(&service, query, p)),
-                Err(e) => {
-                    self.record(&service, 5.0, false);
-                    warn!("resolver: {} matched '{}' but failed: {}", service, query, e);
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        save_scores(&self.scores_path, &self.scores);
-        Err(last_err.unwrap_or_else(|| Error::Other(format!("resolver: no source has '{query}'"))))
+        (None, last_err)
     }
 
     /// Download one candidate (direct track or album container), verify

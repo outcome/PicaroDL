@@ -41,6 +41,8 @@ futures.workspace = true
 
 [features]
 # Chrome TLS-fingerprint emulation (khinsider module) - needs cmake+nasm
-# (+ libclang for bindgen) for BoringSSL; no browser anywhere:
-#   cargo build --features impersonate
+# (+ libclang for bindgen) for BoringSSL; no browser anywhere.
+# ON BY DEFAULT for desktop; Switch/Android or minimal toolchains use
+#   cargo build --no-default-features
+default = ["impersonate"]
 impersonate = ["picaro-modules/cf-impersonate"]
