@@ -116,6 +116,7 @@ won't be faked.
 |---|---|---|
 | YouTube Music | Opus (stream) | music.youtube.com (InnerTune-style InnerTube API for search; yt-dlp for delivery) |
 | InternetArchive | FLAC / MP3 | archive.org |
+| Khinsider | FLAC / MP3 | downloads.khinsider.com (game soundtracks; needs --features impersonate) |
 | Soulseek | FLAC / MP3 | slsknet.org (P2P, on by default) |
 | PirateBay | FLAC / MP3 | thepiratebay.org via apibay.org (BitTorrent magnet; opt-in) |
 | DarkTorrent | FLAC / MP3 | darktorrent.org (`.torrent` files; opt-in) |
@@ -304,9 +305,31 @@ HTTP, so it can live on any machine on your LAN). Neither is required.
 
 ### Cloudflare-gated sources
 
-Some FLAC sites are otherwise perfect — direct downloads, regex-friendly — but
-sit behind Cloudflare's JS challenge. PicaroDL carries no browser, but the
-clearance is just data: solve once anywhere, and every platform can use it.
+PicaroDL ships **no browser**, but it doesn't need one for the source that
+matters:
+
+**Khinsider (game soundtracks, FLAC/MP3)** gates its album/track pages with
+a Cloudflare WAF rule on the **TLS fingerprint** — no cookie can ever pass
+it. Building with
+
+```bash
+cargo build --release --features impersonate
+```
+
+adds **Chrome TLS-fingerprint emulation** (the `wreq` client, BoringSSL):
+plain HTTP with a real Chrome ClientHello + HTTP/2 fingerprint. Verified:
+album and track pages that 403 every library TLS return 200 with the full
+track table — **no browser, no cookies, no webview, works on every platform
+BoringSSL builds** (Android NDK included). E2E: single track FLAC in
+**4–5s**, whole 45-track OST in **109s**.
+
+Build toolchain for `--features impersonate`: `cmake`, `nasm`, and
+`libclang.dll` (for bindgen) on PATH / `LIBCLANG_PATH`. Default builds
+(neither desktop nor Switch/Android) compile no BoringSSL at all and simply
+skip the module.
+
+For the classic **JS-challenge** sites (where a cookie IS the answer), the
+clearance is just data — solve once anywhere, every platform uses it:
 
 `config/cf-cookies.json` holds solved sessions per domain:
 
@@ -328,9 +351,9 @@ clearance is just data: solve once anywhere, and every platform can use it.
 
 | Platform | Path to gated sources |
 |---|---|
-| Windows / Linux desktop | FlareSolverr locally, or solve in your browser and copy the cookie |
-| Android (CLI) | copy a solved `config/cf-cookies.json` from your PC |
-| Switch homebrew | copy `cf-cookies.json`, or use FlareSolverr over LAN |
+| Windows / Linux / Mac desktop | `--features impersonate` (khinsider); FlareSolverr or cookie-copy for challenge sites |
+| Android | `--features impersonate` via NDK (BoringSSL builds there); or copy `cf-cookies.json` |
+| Switch homebrew | copy `cf-cookies.json` for challenge sites; impersonate builds if the devkit toolchain has cmake+nasm |
 
 Cookies are bound to the solving IP + user agent; if the site still blocks,
 re-solve from the same network.

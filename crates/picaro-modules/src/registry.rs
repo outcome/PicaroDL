@@ -121,6 +121,8 @@ pub fn register_all(registry: &ModuleRegistry) -> Result<()> {
     crate::globaldjmix::register_module(registry);
     crate::grimearchive::register_module(registry);
     crate::internetarchive::register_module(registry);
+    #[cfg(feature = "cf-impersonate")]
+    crate::khinsider::register_module(registry);
     crate::lrclib::register_module(registry);
     crate::lyrics_ovh::register_module(registry);
     crate::lyrist::register_module(registry);

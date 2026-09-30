@@ -15,7 +15,11 @@ pub mod fondsound;
 pub mod freemp3cloud;
 pub mod globaldjmix;
 pub mod grimearchive;
+pub mod impersonate;
 pub mod internetarchive;
+
+#[cfg(feature = "cf-impersonate")]
+pub mod khinsider;
 pub mod lrclib;
 pub mod lyrics_ovh;
 pub mod lyrist;

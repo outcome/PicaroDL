@@ -13,6 +13,11 @@ default = []
 # (pulls in boa_engine), requires a `browsers.json` file at runtime, and does not
 # solve Cloudflare "managed" challenges in practice. Prefer PICARO_FLARESOLVERR.
 cloudscraper = ["dep:cloudscraper"]
+# Chrome TLS-fingerprint emulation (wreq/BoringSSL): defeats WAF rules
+# that block non-browser TLS (khinsider's album/track pages) with no
+# browser, no cookies, no webview. BoringSSL needs cmake + nasm
+# (+ libclang for bindgen) in the build toolchain.
+cf-impersonate = ["dep:wreq", "dep:wreq-util"]
 
 [dependencies]
 picaro-core = { path = "../picaro-core" }
@@ -65,3 +70,5 @@ markup5ever = "0.14"
 # NOTE: crates.io has no `cloudscraper` package (404). The closest maintained
 # crate is `cloudscraper-rs`; alias it so the import path stays `cloudscraper`.
 cloudscraper = { package = "cloudscraper-rs", version = "0.2.0", optional = true }
+wreq = { version = "6.0.0-rc.31", optional = true }
+wreq-util = { version = "3.0.0-rc.14", optional = true }

@@ -164,6 +164,7 @@ impl Resolver {
                 "coreradio",
                 "ektoplazm",
                 "relisten",
+                "khinsider",
                 "soulseek",
             ],
             QualityTier::High => vec![
@@ -978,6 +979,7 @@ fn is_direct_track(service: &str) -> bool {
             | "mp3zona"
             | "mp3tut"
             | "soulseek"
+            | "khinsider"
     )
 }
 
