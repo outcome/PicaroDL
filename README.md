@@ -314,6 +314,19 @@ picaro error <message>
   track. `get-track --pos N` sees INSIDE bundles too: it extracts track N,
   names and tags it, and deletes the archive and the remaining files.
   Rejected downloads never leave files behind.
+- **Album re-runs are idempotent**: when the release's folder already holds
+  every track, `get-album` prints the existing `Downloaded:` lines and
+  exits 0 without fetching the bundle. Completeness is judged from a
+  `.picaro-release.json` sidecar PicaroDL writes into the album folder
+  after a bundle download (exact count; never deleted), falling back to
+  the module's expected track count. Extraction is staged under `temp/`
+  and merged in, so a re-run can never unpack a second/nested copy of
+  tracks already on disk, and nothing in the library folder is ever
+  deleted by a re-run.
+- **Bundle progress carries the album name**: during a bundle download the
+  `picaro track-start` / `picaro progress` lines name the release (e.g.
+  `picaro progress <bytes> <total> Injury Episode (2026)`), never a
+  placeholder like `" -  (FLAC)"`.
 - `--json` on `get-album` prints a single JSON object instead of
   `Downloaded:` lines: `{"album":…, "service":…, "tier":…, "served":…,
   "files":[absolute paths in order]}`.

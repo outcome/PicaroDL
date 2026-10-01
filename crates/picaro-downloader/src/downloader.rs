@@ -350,6 +350,62 @@ fn flatten_single_top_dir(dir: &Path) {
     let _ = std::fs::remove_dir(inner);
 }
 
+/// Move a staged extraction's contents into `to`, preserving the
+/// directory layout. A file whose target already exists is LEFT BEHIND in
+/// the staging dir (the caller deletes it with the staging tree) - a
+/// re-run must never overwrite or duplicate tracks already in the
+/// library. Nothing in `to` is ever deleted.
+fn merge_extraction_into(from: &Path, to: &Path) {
+    fn visit(dir: &Path, base: &Path, to: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                visit(&p, base, to);
+                continue;
+            }
+            let Ok(rel) = p.strip_prefix(base) else {
+                continue;
+            };
+            let target = to.join(rel);
+            if target.exists() {
+                continue;
+            }
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::rename(&p, &target).is_err() {
+                // Cross-device - copy; the staging tree is removed either way.
+                let _ = std::fs::copy(&p, &target);
+            }
+        }
+    }
+    visit(from, from, to);
+}
+
+/// Per-release sidecar recording the exact audio-file count a completed
+/// bundle download left in the album folder, so re-runs can recognise a
+/// fully-downloaded release without re-fetching it (page-derived track
+/// counts can be wrong: a single's promo text may list a whole album).
+fn write_release_sidecar(album_path: &Path, service: &str, album: &AlbumInfo, tracks: usize) {
+    let doc = serde_json::json!({
+        "service": service,
+        "album": album.name,
+        "tracks": tracks,
+    });
+    let _ = std::fs::write(album_path.join(".picaro-release.json"), doc.to_string());
+}
+
+/// Read the track count a previous run recorded, if any. `path` is the
+/// sidecar file itself.
+fn read_release_sidecar(path: &Path) -> Option<usize> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    v.get("tracks")?.as_u64().map(|n| n as usize)
+}
+
 /// Natural track ordering key: disc folder, then leading "NN." number,
 /// then filename - so "02. questioning" sorts after "01. lose the rain"
 /// and "10." after "09." (lexicographic would put "10" before "2").
@@ -1107,6 +1163,92 @@ impl Downloader {
         // archive holding every track (e.g. CoreRadio's per-album 7z), so keep
         // everything it extracts rather than just the first song.
         let single_archive = album.tracks.len() == 1;
+        // Idempotency: a re-run against a release that is already fully on
+        // disk must not fetch the (often several-hundred-MB) bundle again.
+        // Completeness signal, best first: the sidecar written after a real
+        // bundle download (exact), the module's expected track count, or -
+        // for per-track releases - the track list length. If the album
+        // folder already holds every track, report those files and stop -
+        // same events as a real run so a UI's item accounting completes
+        // normally.
+        if !globals.get_bool_or("advanced", "ignore_existing_files", false) {
+            let sidecar = album_path.join(".picaro-release.json");
+            let sidecar_tracks = read_release_sidecar(&sidecar);
+            let expected = match sidecar_tracks {
+                Some(n) => Some(n),
+                None => match album.expected_track_count.filter(|n| *n > 0) {
+                    Some(n) => Some(n as usize),
+                    None if !single_archive => Some(album.tracks.len()),
+                    _ => None,
+                },
+            };
+            if let Some(expected) = expected {
+                let mut existing = Vec::new();
+                collect_audio_files(&album_path, &mut existing);
+                if existing.len() >= expected {
+                    sort_tracks_naturally(&mut existing);
+                    if sidecar_tracks.is_none() {
+                        write_release_sidecar(&album_path, service, &album, existing.len());
+                    }
+                    for f in &existing {
+                        let name = f
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let _ = self
+                            .events
+                            .0
+                            .send(DownloadEvent::ItemStarted { name: name.clone() });
+                        let _ = self.events.0.send(DownloadEvent::ItemDone {
+                            name,
+                            location: f.clone(),
+                        });
+                    }
+                    let _ = self.events.0.send(DownloadEvent::Finished {
+                        service: service.to_string(),
+                        succeeded: existing.len() as u32,
+                        skipped: 0,
+                        failed: 0,
+                    });
+                    return Ok(existing);
+                }
+            }
+        }
+        // Album context for modules whose album "track" is really the
+        // release bundle: names the bundle after the album (progress and
+        // event lines read the album name, not a placeholder) and gives
+        // the module artist/year/cover metadata.
+        let mut album_data: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "album".to_string(),
+            serde_json::Value::String(album.name.clone()),
+        );
+        meta.insert(
+            "artist".to_string(),
+            serde_json::Value::String(album.artist.clone()),
+        );
+        if let Some(cover) = &album.cover_url {
+            meta.insert(
+                "cover".to_string(),
+                serde_json::Value::String(cover.clone()),
+            );
+        }
+        meta.insert(
+            "year".to_string(),
+            serde_json::Value::from(album.release_year),
+        );
+        album_data.insert(
+            "__album_meta__".to_string(),
+            serde_json::Value::Object(meta),
+        );
+        if single_archive {
+            album_data.insert(
+                "__track_name__".to_string(),
+                serde_json::Value::String(album.name.clone()),
+            );
+        }
         for (idx, track) in album.tracks.iter().enumerate() {
             let id = track.id();
             let item_name = match track {
@@ -1125,7 +1267,13 @@ impl Downloader {
             // Build a per-track filename inside the album folder
             let global_album = self.globals();
             match self
-                .download_track_into(service, id, Some(&album_path), &global_album)
+                .download_track_into(
+                    service,
+                    id,
+                    Some(&album_path),
+                    &global_album,
+                    album_data.clone(),
+                )
                 .await
             {
                 Ok(p) => {
@@ -1187,6 +1335,14 @@ impl Downloader {
             skipped,
             failed,
         });
+        // A completed bundle download knows the release's real file count -
+        // record it so the next run can skip the bundle without trusting
+        // page-derived tracklists.
+        if single_archive && succeeded > 0 {
+            let mut all = Vec::new();
+            collect_audio_files(&album_path, &mut all);
+            write_release_sidecar(&album_path, service, &album, all.len());
+        }
         // Tracks land in release order so a UI can report them as an
         // ordered list ("01. ..." before "02. ...", "10." after "09.").
         sort_tracks_naturally(&mut paths);
@@ -1455,6 +1611,7 @@ impl Downloader {
         track_id: &str,
         album_path: Option<&Path>,
         globals: &GlobalSettings,
+        data: HashMap<String, serde_json::Value>,
     ) -> Result<PathBuf> {
         // Almost identical to download_track but with the option to use the
         // album-supplied track metadata so the on-disk filename lines up with
@@ -1463,7 +1620,7 @@ impl Downloader {
         let quality = self.picaro.current_quality();
         let codec_options = self.picaro.codec_options();
         let mut track_info = module
-            .get_track_info(track_id, quality, &codec_options, HashMap::new())
+            .get_track_info(track_id, quality, &codec_options, data)
             .await?;
         if let Some(err) = &track_info.error {
             return Err(Error::Download(err.clone()));
@@ -1709,9 +1866,19 @@ impl Downloader {
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| self.output_path.clone());
-            extract_archive_of_kind(&dest, kind, &extract_to).await?;
-            postprocess_extraction(&extract_to);
+            // Stage the extraction under temp/ instead of unpacking
+            // straight into the library folder: on a re-run the album
+            // folder already holds the previous extraction's tracks, and
+            // a direct unpack would re-create the bundle's wrapper folder
+            // alongside (or nested inside) them. The merge below moves
+            // only files that don't already exist.
+            let staging = crate::http::create_temp_filename_with_ext("extracted");
+            std::fs::create_dir_all(&staging)?;
+            extract_archive_of_kind(&dest, kind, &staging).await?;
+            postprocess_extraction(&staging);
             let _ = tokio::fs::remove_file(&dest).await;
+            merge_extraction_into(&staging, &extract_to);
+            let _ = std::fs::remove_dir_all(&staging);
             if let Some(c) = &cover_path {
                 let _ = std::fs::remove_file(c);
             }
@@ -1822,7 +1989,7 @@ impl Downloader {
         for (idx, track) in playlist.tracks.iter().enumerate() {
             let id = track.id();
             match self
-                .download_track_into(service, id, Some(&playlist_path), &globals)
+                .download_track_into(service, id, Some(&playlist_path), &globals, HashMap::new())
                 .await
             {
                 Ok(p) => {

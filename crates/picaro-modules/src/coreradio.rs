@@ -426,6 +426,10 @@ impl picaro_utils::module::ModuleInterface for CoreRadioModule {
         };
         let html = fetch_album_page(&self.client, &url).await?;
         let (artist, album, _title, cover, year) = parse_album_meta(&html);
+        // The page's tracklist is the only way to know the release's track
+        // count without downloading the bundle; the downloader uses it to
+        // recognise an already-downloaded album (idempotent get-album).
+        let tracklist = parse_tracklist(&html);
         let quality = parse_quality(&html).unwrap_or_default();
         let flac_hash = parse_download_hash(&html, "FLAC").ok_or_else(|| {
             Error::Other("coreradio: FLAC download link not found on album page".to_string())
@@ -444,6 +448,7 @@ impl picaro_utils::module::ModuleInterface for CoreRadioModule {
             }),
             cover_url: cover,
             cover_type: Some(ImageFileType::Jpg),
+            expected_track_count: (!tracklist.is_empty()).then(|| tracklist.len() as u32),
             ..Default::default()
         })
     }
