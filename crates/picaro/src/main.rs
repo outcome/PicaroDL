@@ -118,6 +118,10 @@ enum Command {
         /// Restrict to a single provider (e.g. flacmusic).
         #[arg(long)]
         only: Option<String>,
+        /// Expected track duration in seconds; a downloaded file wildly
+        /// off (<50% / >200%) is rejected as the wrong song.
+        #[arg(long)]
+        expected_seconds: Option<u64>,
     },
 
     /// Query every lyrics provider for "artist - title".
@@ -160,6 +164,26 @@ enum Command {
         /// Restrict to a single provider.
         #[arg(long)]
         only: Option<String>,
+        /// Expected track duration in seconds; a downloaded file wildly
+        /// off (<50% / >200%) is rejected as the wrong song.
+        #[arg(long)]
+        expected_seconds: Option<u64>,
+    },
+
+    /// Download a whole album release ("artist - album", one source).
+    GetAlbum {
+        /// "artist - album title" to resolve the release.
+        #[arg(long)]
+        album: String,
+        /// Target quality: lossless|high|medium|low.
+        #[arg(short, long, default_value = "high")]
+        quality: String,
+        /// Restrict to a single provider.
+        #[arg(long)]
+        only: Option<String>,
+        /// Machine output: one JSON object (no Downloaded lines).
+        #[arg(long)]
+        json: bool,
     },
 
     /// Benchmark sources against a fixed query set (timing + result counts).
@@ -452,6 +476,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             pos,
             quality,
             only,
+            expected_seconds,
         } => {
             let tier = picaro_utils::quality::QualityTier::parse(&quality).ok_or_else(|| {
                 anyhow::anyhow!("invalid quality '{quality}' (lossless|high|medium|low)")
@@ -487,7 +512,28 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             };
-            // 3. Pick the track at disc/pos.
+            let downloader = make_downloader(picaro.clone(), &cli);
+            // 3. A release that resolves to a SINGLE download id is usually
+            // a bundle (7z/zip/rar) holding every track - CoreRadio's
+            // per-album archive. Fetch it once, extract, and pick the track
+            // at `pos`; the archive and the rest are deleted afterwards.
+            if info.tracks.len() == 1 {
+                match downloader
+                    .download_track_from_bundle(&r.service, &info, pos, expected_seconds)
+                    .await
+                {
+                    Ok(p) => {
+                        let abs = std::fs::canonicalize(&p).unwrap_or(p);
+                        println!("Downloaded: {}", display_path(&abs).display());
+                    }
+                    Err(e) => {
+                        println!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
+            // 4. Per-track listing: pick the track at disc/pos.
             let disc_tracks: Vec<&picaro_utils::models::TrackRef> = info
                 .tracks
                 .iter()
@@ -517,9 +563,8 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             } else {
                 track_name
             };
-            // 4. Download it (archive containers pick the named file).
-            let downloader = make_downloader(picaro.clone(), &cli);
-            spawn_progress_printer(&downloader);
+            // 5. Download it (archive containers pick the named file).
+            // (make_downloader already spawned the progress printer.)
             let mut data = HashMap::new();
             data.insert(
                 "__track_name__".to_string(),
@@ -536,12 +581,126 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 .await
             {
                 Ok(p) => {
+                    // Duration fingerprint (W2): a wildly-off duration means
+                    // the source served the wrong song - reject it.
+                    if let Some(exp) = expected_seconds {
+                        if let Err(e) =
+                            picaro_downloader::fingerprint::verify_expected_duration(&p, exp)
+                        {
+                            picaro_downloader::fingerprint::remove_with_sidecars(&p);
+                            println!("error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
                     let abs = std::fs::canonicalize(&p).unwrap_or(p.clone());
                     println!("Downloaded: {}", display_path(&abs).display());
                 }
                 Err(e) => {
                     println!("error: {e}");
                     std::process::exit(1);
+                }
+            }
+        }
+        Command::GetAlbum {
+            album,
+            quality,
+            only,
+            json,
+        } => {
+            use picaro_utils::quality::QualityTier;
+
+            let tier = QualityTier::parse(&quality).ok_or_else(|| {
+                anyhow::anyhow!("invalid quality '{quality}' (lossless|high|medium|low)")
+            })?;
+            let mut resolver = picaro_downloader::resolver::Resolver::new(
+                picaro.clone(),
+                picaro_core::loader::config_dir().join("providers.json"),
+            );
+            resolver.set_only(only);
+            let emit_err = |msg: String| {
+                if json {
+                    println!("{{\"error\":{}}}", serde_json::to_string(&msg).unwrap());
+                } else {
+                    println!("error: {msg}");
+                }
+                std::process::exit(1);
+            };
+            // 1. Resolve the release ONCE.
+            let r = match resolver.resolve(&album, tier).await {
+                Ok(r) => r,
+                Err(e) => {
+                    emit_err(e.to_string());
+                    return Ok(());
+                }
+            };
+            // 2. What tier does this source actually serve?
+            let module = match picaro.load_module(&r.service).await {
+                Ok(m) => m,
+                Err(e) => {
+                    emit_err(format!("load {}: {e}", r.service));
+                    return Ok(());
+                }
+            };
+            let info = match module.get_album_info(&r.result_id, HashMap::new()).await {
+                Ok(i) => i,
+                Err(e) => {
+                    emit_err(format!("album info from {}: {e}", r.service));
+                    return Ok(());
+                }
+            };
+            let served = album_served_tier(&info, &r.service);
+            if served.rank() < tier.rank() {
+                if !resolver.allow_mixed_quality() {
+                    emit_err(format!(
+                        "wanted {}, {} only has {}",
+                        tier.as_str(),
+                        r.service,
+                        served.as_str()
+                    ));
+                    return Ok(());
+                }
+                // Announce the step-down FIRST so the UI can warn.
+                if !json {
+                    println!("picaro tier {} {}", tier.as_str(), served.as_str());
+                }
+            }
+            // 3. Download the whole release from that ONE source.
+            let downloader = make_downloader(picaro.clone(), &cli);
+            let files = match downloader.download_album(&r.service, &r.result_id).await {
+                Ok(f) => f,
+                Err(e) => {
+                    emit_err(e.to_string());
+                    return Ok(());
+                }
+            };
+            let files: Vec<PathBuf> = files
+                .into_iter()
+                .filter(|p| p.is_file())
+                .map(|p| {
+                    let abs = std::fs::canonicalize(&p).unwrap_or(p);
+                    display_path(&abs)
+                })
+                .collect();
+            if files.is_empty() {
+                emit_err(format!("album produced no files from {}", r.service));
+                return Ok(());
+            }
+            if json {
+                let jfiles: Vec<String> = files
+                    .iter()
+                    .map(|p| serde_json::to_string(p.to_string_lossy().as_ref()).unwrap())
+                    .collect();
+                println!(
+                    "{{\"album\":{}, \"service\":\"{}\", \"tier\":\"{}\", \"served\":\"{}\", \"files\":[{}]}}",
+                    serde_json::to_string(&info.name).unwrap(),
+                    r.service,
+                    tier.as_str(),
+                    served.as_str(),
+                    jfiles.join(",")
+                );
+            } else {
+                for f in &files {
+                    println!("Downloaded: {}", f.display());
                 }
             }
         }
@@ -602,6 +761,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             resolve_only,
             json,
             only,
+            expected_seconds,
         } => {
             let tier = picaro_utils::quality::QualityTier::parse(&quality).ok_or_else(|| {
                 anyhow::anyhow!("invalid quality '{quality}' (lossless|high|medium|low)")
@@ -664,7 +824,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             } else {
                 let downloader = make_downloader(picaro.clone(), &cli);
                 match resolver
-                    .resolve_and_download(&downloader, &query, tier)
+                    .resolve_and_download(&downloader, &query, tier, expected_seconds)
                     .await
                 {
                     Ok(path) => {
@@ -786,6 +946,55 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Best tier a resolved release can actually serve, from the module's
+/// own quality metadata (falling back to track codecs / known source
+/// classes). Used by `get-album` to announce or refuse a step-down.
+fn album_served_tier(
+    info: &picaro_utils::models::AlbumInfo,
+    service: &str,
+) -> picaro_utils::quality::QualityTier {
+    use picaro_utils::quality::QualityTier;
+    let q = info
+        .quality
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if q.contains("flac")
+        || q.contains("lossless")
+        || q.contains("alac")
+        || q.contains("wav")
+        || q.contains("aiff")
+    {
+        return QualityTier::Lossless;
+    }
+    if q.contains("320") {
+        return QualityTier::High;
+    }
+    if q.contains("256") || q.contains("192") {
+        return QualityTier::Medium;
+    }
+    if q.contains("128") {
+        return QualityTier::Low;
+    }
+    // Track-listing codecs tell the truth for per-track sources.
+    for t in &info.tracks {
+        if let picaro_utils::models::TrackRef::Full(f) = t {
+            if f.codec.is_lossless() {
+                return QualityTier::Lossless;
+            }
+        }
+    }
+    // Known FLAC-first direct sources default to lossless; everything
+    // else on the no-login chain serves MP3-class audio.
+    match service {
+        "technicaldeathmetal" | "coreradio" | "ektoplazm" | "relisten" | "khinsider" => {
+            QualityTier::Lossless
+        }
+        "youtube" | "soundcloud" => QualityTier::Low,
+        _ => QualityTier::High,
+    }
+}
+
 fn fmt_of(name: &str) -> &'static str {
     match name.to_lowercase().as_str() {
         "flacmusic" | "losslessalbums" | "coreradio" | "alterportal" | "exystence"
@@ -869,6 +1078,15 @@ fn spawn_progress_printer(downloader: &Arc<Downloader>) {
                 }
                 DownloadEvent::TrackFailed { name, reason, .. } => {
                     println!("picaro fail {name} {reason}");
+                }
+                DownloadEvent::ItemStarted { name } => {
+                    println!("picaro item-start {name}");
+                }
+                DownloadEvent::ItemDone { name, location } => {
+                    println!("picaro item-done {name} {}", location.display());
+                }
+                DownloadEvent::TierNotice { requested, served } => {
+                    println!("picaro tier {requested} {served}");
                 }
                 DownloadEvent::Finished {
                     succeeded,

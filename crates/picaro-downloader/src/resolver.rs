@@ -443,8 +443,15 @@ impl Resolver {
     }
 
     /// Resolve `query` to the first provider with a relevant search hit.
+    ///
+    /// With `allow_mixed_quality=false` the tier ladder never steps
+    /// DOWN: only the requested tier and higher ones are tried, and a
+    /// miss is reported instead of silently serving a lower tier.
     pub async fn resolve(&mut self, query: &str, tier: QualityTier) -> Result<Resolution> {
         for t in tier.fallback_order() {
+            if !self.allow_mixed_quality && t.rank() < tier.rank() {
+                continue;
+            }
             for chunk in self.chain_for(t).chunks(self.max_parallel.max(1)) {
                 let batch: Vec<String> = chunk.to_vec();
                 let (hit, obs) = self.race(t, query, &batch).await;
@@ -457,7 +464,19 @@ impl Resolver {
                 }
             }
         }
+        if !self.allow_mixed_quality {
+            return Err(Error::Other(format!(
+                "wanted {}, no source has '{}' at that tier (allow_mixed_quality=false)",
+                tier.as_str(),
+                query
+            )));
+        }
         Err(Error::Other(format!("resolver: no source has '{query}'")))
+    }
+
+    /// The configured `resolver.allow_mixed_quality` semantics.
+    pub fn allow_mixed_quality(&self) -> bool {
+        self.allow_mixed_quality
     }
 
     /// Resolve and download, falling back across providers and tiers.
@@ -475,11 +494,19 @@ impl Resolver {
     ///
     /// The requested tier is a ceiling: sources that only deliver
     /// higher-tier content sit out when a lower tier was asked for.
+    /// A step DOWN is only attempted when `allow_mixed_quality` permits
+    /// it, and it is always announced first via a TierNotice event
+    /// (`picaro tier <requested> <served>`) so a UI can warn the user.
+    /// `expected_secs` (when known) enables duration fingerprinting: a
+    /// candidate whose actual duration is wildly off is rejected and the
+    /// next source is tried.
+    #[allow(clippy::too_many_arguments)]
     pub async fn resolve_and_download(
         &mut self,
         downloader: &Downloader,
         query: &str,
         tier: QualityTier,
+        expected_secs: Option<u64>,
     ) -> Result<PathBuf> {
         let mut last_err: Option<Error> = None;
         let min_match = self.min_match;
@@ -552,6 +579,13 @@ impl Resolver {
 
         // Fire every search simultaneously. P2P windows are longer:
         // Soulseek's own search waits ~15s for peers to answer.
+        // Lossless-tier sources get the lossless probe budget here too:
+        // CoreRadio's song lookup (MusicBrainz + album page fetches)
+        // needs far more than the 4s default probe, and the asymmetry
+        // made `get --resolve-only` (14s budget) find the FLAC while the
+        // real `get` wave (4s budget) silently fell through to an MP3
+        // source. (E2: resolve-only said coreradio [lossless], get
+        // served mp3tut [lossy].)
         let min_seeders: u64 = self
             .picaro
             .merged_globals
@@ -559,12 +593,19 @@ impl Resolver {
             .and_then(|v| v.get("min_seeders"))
             .and_then(|v| v.as_u64())
             .unwrap_or(5);
+        let wave_budget = if services.iter().any(|s| lossless_src(s)) {
+            self.timeout_lossless.max(self.timeout)
+        } else {
+            self.timeout
+        };
         let mut direct_futs = FuturesUnordered::new();
         let mut p2p_futs = FuturesUnordered::new();
         for s in services {
             let p2p = is_p2p(&s);
             let to = if p2p {
-                self.timeout.max(Duration::from_secs(25))
+                wave_budget.max(Duration::from_secs(25))
+            } else if lossless_src(&s) {
+                self.timeout_lossless
             } else {
                 self.timeout
             };
@@ -585,8 +626,9 @@ impl Resolver {
         // Collect direct hits (all bounded by the probe timeout; a short
         // grace covers module loading).
         let mut direct_hits: Vec<(String, f64, SearchResult)> = Vec::new();
-        let direct_deadline =
-            tokio::time::Instant::from_std(Instant::now() + self.timeout + Duration::from_secs(4));
+        let direct_deadline = tokio::time::Instant::from_std(
+            Instant::now() + wave_budget + Duration::from_secs(4),
+        );
         while let Some((s, dt, hits)) = tokio::time::timeout_at(direct_deadline, direct_futs.next())
             .await
             .ok()
@@ -601,6 +643,13 @@ impl Resolver {
             }
         }
 
+        // Duration expectation for a candidate: an explicit
+        // `--expected-seconds` wins; otherwise a search result that
+        // carried a duration (YouTube/innertube) seeds it per candidate.
+        let expect_for = |r: &SearchResult| -> Option<u64> {
+            expected_secs.or(r.duration.map(|d| d as u64)).filter(|d| *d > 0)
+        };
+
         // Group 1: direct lossless sources. Fast HTTP FLAC beats P2P at
         // equal quality.
         let mut g_lossless: Vec<_> = direct_hits
@@ -611,7 +660,15 @@ impl Resolver {
         g_lossless.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         for (service, _, r) in &g_lossless {
             match self
-                .attempt(downloader, query, service, r, QualityTier::Lossless, tier)
+                .attempt(
+                    downloader,
+                    query,
+                    service,
+                    r,
+                    QualityTier::Lossless,
+                    tier,
+                    expect_for(r),
+                )
                 .await
             {
                 Ok(p) => return Ok(self.finish(service, query, p)),
@@ -629,7 +686,14 @@ impl Resolver {
         // Soulseek's 20s search window or a dead torrent attempt.
         if tier == QualityTier::Lossless {
             let (hit, err) = self
-                .p2p_phase(downloader, query, tier, &mut p2p_futs, (min_speed_kbps, slow_strikes, bench_minutes))
+                .p2p_phase(
+                    downloader,
+                    query,
+                    tier,
+                    &mut p2p_futs,
+                    (min_speed_kbps, slow_strikes, bench_minutes),
+                    expected_secs,
+                )
                 .await;
             if let Some((service, p)) = hit {
                 return Ok(self.finish(&service, query, p));
@@ -638,7 +702,11 @@ impl Resolver {
         }
 
         // Group 3: direct MP3 sources (best-scored first), then group 4:
-        // Opus stream providers.
+        // Opus stream providers. These cannot serve a lossless request -
+        // with `allow_mixed_quality=false` they are skipped outright and
+        // the resolve fails honestly; otherwise the step-down is
+        // announced FIRST (`picaro tier <requested> <served>`) so the UI
+        // can warn the user instead of silently receiving an MP3.
         let expected_direct = if tier == QualityTier::Lossless {
             QualityTier::High
         } else {
@@ -650,9 +718,36 @@ impl Resolver {
             .cloned()
             .collect::<Vec<(String, f64, SearchResult)>>();
         g_direct.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let step_down = tier.rank() > expected_direct.rank();
+        if step_down && !self.allow_mixed_quality {
+            save_scores(&self.scores_path, &self.scores);
+            return Err(last_err.unwrap_or_else(|| {
+                Error::Other(format!(
+                    "wanted {}, no source delivered '{}' at that tier (allow_mixed_quality=false)",
+                    tier.as_str(),
+                    query
+                ))
+            }));
+        }
+        if step_down && !g_direct.is_empty() {
+            let _ = downloader
+                .sender()
+                .send(crate::downloader::DownloadEvent::TierNotice {
+                    requested: tier.as_str().to_string(),
+                    served: expected_direct.as_str().to_string(),
+                });
+        }
         for (service, _, r) in g_direct {
             match self
-                .attempt(downloader, query, &service, &r, expected_direct, tier)
+                .attempt(
+                    downloader,
+                    query,
+                    &service,
+                    &r,
+                    expected_direct,
+                    tier,
+                    expect_for(&r),
+                )
                 .await
             {
                 Ok(p) => return Ok(self.finish(&service, query, p)),
@@ -669,7 +764,14 @@ impl Resolver {
         // the phase starts instantly.
         if tier != QualityTier::Lossless {
             let (hit, err) = self
-                .p2p_phase(downloader, query, tier, &mut p2p_futs, (min_speed_kbps, slow_strikes, bench_minutes))
+                .p2p_phase(
+                    downloader,
+                    query,
+                    tier,
+                    &mut p2p_futs,
+                    (min_speed_kbps, slow_strikes, bench_minutes),
+                    expected_secs,
+                )
                 .await;
             if let Some((service, p)) = hit {
                 return Ok(self.finish(&service, query, p));
@@ -683,17 +785,45 @@ impl Resolver {
             .cloned()
             .collect::<Vec<(String, f64, SearchResult)>>();
         g_opus.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Opus streams are the last-resort tier.
+        let expected = if tier == QualityTier::Lossless {
+            QualityTier::High
+        } else {
+            tier
+        };
+        let opus_step_down = tier.rank() > QualityTier::Low.rank();
+        if !g_opus.is_empty() && opus_step_down && !self.allow_mixed_quality {
+            save_scores(&self.scores_path, &self.scores);
+            return Err(last_err.unwrap_or_else(|| {
+                Error::Other(format!(
+                    "wanted {}, no source delivered '{}' at that tier (allow_mixed_quality=false)",
+                    tier.as_str(),
+                    query
+                ))
+            }));
+        }
+        if !g_opus.is_empty() && opus_step_down {
+            let _ = downloader
+                .sender()
+                .send(crate::downloader::DownloadEvent::TierNotice {
+                    requested: tier.as_str().to_string(),
+                    served: QualityTier::Low.as_str().to_string(),
+                });
+        }
         for (service, _, r) in g_opus {
             // Opus streams are the last-resort tier; quality-check them
             // laxly (a lossless request accepting an opus fallback is
             // the designed behavior, not a guard violation).
-            let expected = if tier == QualityTier::Lossless {
-                QualityTier::High
-            } else {
-                tier
-            };
             match self
-                .attempt(downloader, query, &service, &r, expected, tier)
+                .attempt(
+                    downloader,
+                    query,
+                    &service,
+                    &r,
+                    expected,
+                    tier,
+                    expect_for(&r),
+                )
                 .await
             {
                 Ok(p) => return Ok(self.finish(&service, query, p)),
@@ -723,6 +853,7 @@ impl Resolver {
         tier: QualityTier,
         p2p_futs: &mut FuturesUnordered<SearchFut>,
         (min_speed_kbps, slow_strikes, bench_minutes): (f64, u32, u64),
+        expected_secs: Option<u64>,
     ) -> (Option<(String, PathBuf)>, Option<Error>) {
         let mut p2p_hits: Vec<(String, f64, SearchResult)> = Vec::new();
         let p2p_deadline =
@@ -767,7 +898,8 @@ impl Resolver {
             }
             p2p_tries += 1;
             let t0 = Instant::now();
-            let attempt_fut = self.attempt(downloader, query, service, r, tier, tier);
+            let expect = expected_secs.or(r.duration.map(|d| d as u64)).filter(|d| *d > 0);
+            let attempt_fut = self.attempt(downloader, query, service, r, tier, tier, expect);
             let outcome = match tokio::time::timeout(remaining, attempt_fut).await {
                 Ok(res) => res,
                 Err(_) => {
@@ -817,7 +949,8 @@ impl Resolver {
     }
 
     /// Download one candidate (direct track or album container), verify
-    /// quality against `expected`, and hand back the produced path.
+    /// quality against `expected` and duration against `expected_secs`
+    /// when known, and hand back the produced path.
     async fn attempt(
         &self,
         downloader: &Downloader,
@@ -826,6 +959,7 @@ impl Resolver {
         hit: &SearchResult,
         expected: QualityTier,
         _ceiling: QualityTier,
+        expected_secs: Option<u64>,
     ) -> Result<PathBuf> {
         let name = hit.name.clone().unwrap_or_default();
         let result_id = hit.result_id.clone();
@@ -872,10 +1006,40 @@ impl Resolver {
         });
         let p = result?;
         if !quality_ok(&p, expected) {
-            let _ = std::fs::remove_file(&p);
+            crate::fingerprint::remove_with_sidecars(&p);
             return Err(Error::Download(format!(
                 "{service} returned a file that doesn't match {expected:?} quality (wrong container / likely fake)"
             )));
+        }
+        // Duration fingerprint (W2): reject a wildly-off duration
+        // (wrong song served) and fall through to the next source.
+        if let Some(exp) = expected_secs {
+            if let Err(e) = crate::fingerprint::verify_expected_duration(&p, exp) {
+                crate::fingerprint::remove_with_sidecars(&p);
+                // The downloader already reported `picaro ok` for the
+                // file; pair it with an explicit failure line so a UI
+                // watching the event stream sees the rejection.
+                let _ = downloader.sender().send(crate::downloader::DownloadEvent::TrackFailed {
+                    track_id: hit.result_id.clone(),
+                    name: hit.name.clone().unwrap_or_else(|| query.to_string()),
+                    reason: e.to_string(),
+                });
+                warn!("resolver: {service} duration check failed: {e}");
+                return Err(e);
+            }
+        }
+        // Artist fingerprint: the delivered file's own tags must agree
+        // with the requested artist - catches covers/mislabeled grabs
+        // (the "Re Beatles" incident class).
+        if let Err(e) = crate::fingerprint::verify_delivered_artist(&p, query) {
+            crate::fingerprint::remove_with_sidecars(&p);
+            let _ = downloader.sender().send(crate::downloader::DownloadEvent::TrackFailed {
+                track_id: hit.result_id.clone(),
+                name: hit.name.clone().unwrap_or_else(|| query.to_string()),
+                reason: e.to_string(),
+            });
+            warn!("resolver: {service} artist check failed: {e}");
+            return Err(e);
         }
         Ok(p)
     }
@@ -1036,34 +1200,67 @@ fn is_opus_provider(service: &str) -> bool {
 }
 
 /// Score a search result against "artist - title" by token overlap.
+///
+/// Hard gates (the "intro"/"sweet" incident): BOTH sides must score.
+///   - the query's title tokens must appear somewhere in the candidate
+///     (title, or combined title+artist); a title-less match is a
+///     reject, not a fallback;
+///   - when the candidate carries artist metadata, the query artist must
+///     overlap it too.
 fn score_result(query: &str, r: &SearchResult) -> f64 {
     let (qa, qt) = textmatch::split_query(query);
     let artists = r.artists.as_ref().map(|v| v.join(" ")).unwrap_or_default();
     let name = r.name.as_deref().unwrap_or("");
     let combined = format!("{name} {artists}");
-    let full = match &qa {
-        Some(a) => format!("{a} {qt}"),
-        None => qt.clone(),
-    };
-    let s_full = textmatch::similarity(&full, &combined);
-    let s_artist = textmatch::similarity(&qt, &artists);
-    let s_title = textmatch::similarity(&qt, name);
+    let title_in_name = textmatch::token_presence(&qt, name);
+    let title_in_combined = textmatch::token_presence(&qt, &combined);
+    let title_concat =
+        textmatch::contains_fold(name, &qt) || textmatch::contains_fold(&combined, &qt);
+    // W5: zero title-token presence = not a match, no matter what.
+    if !qt.trim().is_empty()
+        && title_in_name <= 0.0
+        && title_in_combined <= 0.0
+        && !title_concat
+    {
+        return 0.0;
+    }
     match &qa {
         Some(a) => {
             if artists.trim().is_empty() {
                 // Result carries no artist metadata: score by requiring the
                 // FULL query (artist + title tokens) to overlap the result
                 // name, so a same-title/different-artist hit still scores low.
-                s_full
+                let full = format!("{a} {qt}");
+                textmatch::similarity(&full, &combined)
             } else {
-                let a_match =
-                    textmatch::similarity(a, &artists).max(textmatch::similarity(a, &combined));
+                // W5: artist and title BOTH must score. Sources that strip
+                // the space from artist names ("TheBeatles") still match
+                // via the concatenated-substring check.
+                let a_match = textmatch::similarity(a, &artists)
+                    .max(textmatch::similarity(a, &combined))
+                    .max(if textmatch::contains_fold(&artists, a)
+                        || textmatch::contains_fold(&combined, a) {
+                        0.6
+                    } else {
+                        0.0
+                    });
+                if a_match <= 0.0 {
+                    return 0.0;
+                }
+                let s_title = textmatch::similarity(&qt, name);
+                let s_full = textmatch::similarity(&format!("{a} {qt}"), &combined);
                 0.5 * a_match + 0.5 * s_full.max(s_title)
             }
         }
         // No explicit artist: accept if the query matches the artist, the
         // title, or the combined string well.
-        None => s_full.max(s_artist).max(s_title),
+        None => {
+            let full = qt.clone();
+            let s_full = textmatch::similarity(&full, &combined);
+            let s_artist = textmatch::similarity(&qt, &artists);
+            let s_title = textmatch::similarity(&qt, name);
+            s_full.max(s_artist).max(s_title)
+        }
     }
 }
 

@@ -48,6 +48,40 @@ pub fn similarity(a: &str, b: &str) -> f64 {
     inter / union
 }
 
+/// Fraction of `a`'s tokens that appear somewhere in `b` (0.0 when `a`
+/// has no tokens). Used as a hard presence gate: a candidate whose title
+/// shares ZERO tokens with the query title is not a match, no matter how
+/// well the artist lines up.
+pub fn token_presence(a: &str, b: &str) -> f64 {
+    let ta = tokens(a);
+    if ta.is_empty() {
+        return 0.0;
+    }
+    let tb = tokens(b);
+    if tb.is_empty() {
+        return 0.0;
+    }
+    let present = ta.intersection(&tb).count() as f64;
+    present / ta.len() as f64
+}
+
+/// Lowercased alphanumeric-only form of a string ("The Beatles" ->
+/// "thebeatles"), for matching sources that concatenate names.
+pub fn concat_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// Concatenated-substring match: "TheBeatles" contains "thebeatles".
+/// Catches sources that strip the spaces from artist names.
+pub fn contains_fold(haystack: &str, needle: &str) -> bool {
+    let h = concat_key(haystack);
+    let n = concat_key(needle);
+    !n.is_empty() && h.contains(&n)
+}
+
 /// Split "artist - title" into (artist, title). Handles hyphen, en-dash and
 /// em-dash separators; falls back to title-only.
 pub fn split_query(q: &str) -> (Option<String>, String) {

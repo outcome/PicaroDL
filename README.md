@@ -281,6 +281,43 @@ picaro finished <ok> <skipped> <failed>
 picaro error <message>
 ```
 
+### Machine contract for a player backend (Verdania)
+
+- **Result lines** (never change): `Downloaded: <absolute path>` (clean path,
+  no `\\?\`), `MISS: <reason>` + exit 1, `error: <reason>` + exit 1.
+- **Album downloads** (`get-album`): one `Downloaded:` line **per audio file,
+  in release order** (01., 02., … 10. sort numerically), followed by nothing
+  else — there is deliberately NO single `Downloaded: <dir>` line.
+- **Per-track item events** (albums): each track additionally emits
+  `picaro item-start <name>` before it downloads/unpacks and
+  `picaro item-done <name> <path>` when the file exists on disk. A rejected
+  candidate still prints `picaro ok` when it lands, immediately paired with
+  `picaro fail <name> <reason>` when the verifier (duration/artist/quality)
+  rejects it — treat fail as "that file was deleted, keep waiting".
+- **Quality step-downs are announced**: when the request wanted a tier the
+  winning source can't serve, the FIRST line of the step-down group is
+  `picaro tier <requested> <served>` (e.g. `picaro tier lossless high`)
+  — printed **before** the download proceeds, so the UI can warn.
+  With `resolver.allow_mixed_quality = false` there are no silent step-downs
+  at all: a lower tier is never accepted, and the command fails with
+  `error: wanted <tier>, ...` + exit 1.
+- **Wrong-song guard**: pass `--expected-seconds <n>` (get / get-track) and a
+  delivered file whose real duration is <50% or >200% of it is rejected with
+  `error: duration mismatch (expected ~Ns, got Ms)` and the next source is
+  tried. Without the flag, any search hit that carries a duration (YouTube)
+  seeds the check automatically. Delivered files whose own artist tag
+  contradicts the query artist ("Re Beatles" covers for a Beatles query) are
+  rejected and the next source is tried the same way.
+- **Albums as bundles**: sources like CoreRadio serve a whole release as one
+  7z/zip/rar. `get-album` downloads it, extracts (nested archives included),
+  keeps `cover.jpg`, drops junk and the wrapper folder, and reports every
+  track. `get-track --pos N` sees INSIDE bundles too: it extracts track N,
+  names and tags it, and deletes the archive and the remaining files.
+  Rejected downloads never leave files behind.
+- `--json` on `get-album` prints a single JSON object instead of
+  `Downloaded:` lines: `{"album":…, "service":…, "tier":…, "served":…,
+  "files":[absolute paths in order]}`.
+
 ## Safety
 
 - Downloads are **magic-byte validated** and archives are purged of non-audio

@@ -18,6 +18,19 @@ pub fn is_audio_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Cover-art / booklet images that are legitimate album-release content
+/// (e.g. the `cover.jpg` shipped inside a release bundle).
+pub const IMAGE_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "avif", "jfif",
+];
+
+pub fn is_image_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| IMAGE_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 /// Check a file's leading bytes against known audio container magic numbers.
 pub fn looks_like_audio(path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(path) else {
@@ -63,9 +76,10 @@ pub fn looks_like_audio(path: &Path) -> bool {
     false
 }
 
-/// Delete every non-audio file under `dir` (recursively). Returns removed paths.
-/// Used after extracting archives so unexpected payloads (e.g. .exe/.scr/.js)
-/// never remain. Nothing is executed.
+/// Delete every non-audio file under `dir` (recursively), keeping audio
+/// and cover-art images (`cover.jpg` etc. are legitimate album content).
+/// Returns removed paths. Used after extracting archives so unexpected
+/// payloads (e.g. .exe/.scr/.js) never remain. Nothing is executed.
 pub fn purge_non_audio(dir: &Path) -> Vec<PathBuf> {
     let mut removed = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -76,8 +90,17 @@ pub fn purge_non_audio(dir: &Path) -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                // macOS archive junk never holds real content.
+                let name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+                if name == "__MACOSX" {
+                    let _ = std::fs::remove_dir_all(&path);
+                    continue;
+                }
                 stack.push(path);
-            } else if !is_audio_extension(&path) && std::fs::remove_file(&path).is_ok() {
+            } else if !is_audio_extension(&path)
+                && !is_image_extension(&path)
+                && std::fs::remove_file(&path).is_ok()
+            {
                 removed.push(path);
             }
         }

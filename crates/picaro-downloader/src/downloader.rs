@@ -1,6 +1,7 @@
 //! The main downloader - mirrors `picaro/music_downloader.py`.
 
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -20,23 +21,30 @@ use crate::globals::GlobalSettings;
 use crate::http::{download_to_path, DownloadProgress};
 use crate::paths::{build_album_path, build_playlist_path, build_track_filename};
 
-async fn is_7z_archive(path: &Path) -> bool {
-    match tokio::fs::read(path).await {
-        Ok(bytes) if bytes.len() >= 6 => &bytes[0..6] == b"\x37\x7a\xbc\xaf\x27\x1c",
-        _ => false,
+/// Archive container kinds a release may arrive in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveKind {
+    SevenZip,
+    Zip,
+    Rar,
+}
+
+/// Detect an archive by its magic bytes, reading only the header (the
+/// previous implementation slurped the whole file - 344MB for a FLAC
+/// album bundle - just to look at 6 bytes).
+fn detect_archive(path: &Path) -> Option<ArchiveKind> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 8];
+    let n = f.read(&mut buf).ok()?;
+    if n >= 6 && &buf[..6] == b"\x37\x7a\xbc\xaf\x27\x1c" {
+        Some(ArchiveKind::SevenZip)
+    } else if n >= 4 && &buf[..2] == b"PK" {
+        Some(ArchiveKind::Zip)
+    } else if n >= 7 && buf.starts_with(b"Rar!\x1a\x07") {
+        Some(ArchiveKind::Rar)
+    } else {
+        None
     }
-}
-
-fn is_zip_archive(path: &Path) -> bool {
-    std::fs::read(path)
-        .map(|b| b.len() >= 4 && &b[0..2] == b"PK")
-        .unwrap_or(false)
-}
-
-fn is_rar_archive(path: &Path) -> bool {
-    std::fs::read(path)
-        .map(|b| b.len() >= 7 && b.starts_with(b"Rar!\x1a\x07"))
-        .unwrap_or(false)
 }
 
 /// Extract a RAR archive using an external tool (`7z`/`unrar`/`unar`), since
@@ -200,6 +208,179 @@ async fn extract_zip(archive: &Path, out: &Path) -> Result<()> {
     .map_err(|e| Error::Download(format!("zip join: {e}")))?
 }
 
+/// Extract one archive of any supported kind into `out`. Errors bubble
+/// the extraction failure.
+async fn extract_archive_of_kind(archive: &Path, kind: ArchiveKind, out: &Path) -> Result<()> {
+    match kind {
+        ArchiveKind::SevenZip => {
+            let archive = archive.to_path_buf();
+            let out = out.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                sevenz_rust::decompress_file(&archive, &out)
+                    .map_err(|e| Error::Download(format!("7z extraction failed: {e}")))
+            })
+            .await
+            .map_err(|e| Error::Download(format!("7z join: {e}")))??;
+            Ok(())
+        }
+        ArchiveKind::Zip => extract_zip(archive, out).await,
+        ArchiveKind::Rar => extract_rar(archive, out).await,
+    }
+}
+
+/// Post-process a directory a release archive extracted into:
+/// 1. expand any nested archives (some sites zip the 7z; capped depth),
+/// 2. purge everything that is not audio or cover art,
+/// 3. flatten a single top-level folder (archives usually wrap their
+///    content in "Artist - Album (Year)/" which duplicates the library
+///    folder the downloader already created).
+pub fn postprocess_extraction(dir: &Path) {
+    for _ in 0..3 {
+        let mut found = false;
+        let mut files = Vec::new();
+        collect_all_files(dir, &mut files);
+        for f in files {
+            if let Some(kind) = detect_archive(&f) {
+                let out = f
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| dir.to_path_buf());
+                if extract_archive_of_kind_sync(&f, kind, &out) {
+                    let _ = std::fs::remove_file(&f);
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            break;
+        }
+    }
+    let _ = picaro_utils::safety::purge_non_audio(dir);
+    flatten_single_top_dir(dir);
+}
+
+/// Sync extraction for the nested-archive pass (runs on the async runtime
+/// thread, same as the historical code; nested archives are rare/small).
+fn extract_archive_of_kind_sync(archive: &Path, kind: ArchiveKind, out: &Path) -> bool {
+    match kind {
+        ArchiveKind::SevenZip => sevenz_rust::decompress_file(archive, out).is_ok(),
+        ArchiveKind::Zip => {
+            let Ok(f) = std::fs::File::open(archive) else {
+                return false;
+            };
+            let Ok(mut z) = zip::ZipArchive::new(f) else {
+                return false;
+            };
+            for i in 0..z.len() {
+                let Ok(mut entry) = z.by_index(i) else {
+                    continue;
+                };
+                if entry.is_dir() {
+                    continue;
+                }
+                let Some(rel) = entry.enclosed_name() else {
+                    continue;
+                };
+                let name = rel.file_name().and_then(|f| f.to_str()).unwrap_or_default();
+                if name.starts_with("._")
+                    || rel.components().any(|c| c.as_os_str() == "__MACOSX")
+                {
+                    continue;
+                }
+                let target = out.join(&rel);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                if let Ok(mut w) = std::fs::File::create(&target) {
+                    std::io::copy(&mut entry, &mut w).ok();
+                }
+            }
+            true
+        }
+        ArchiveKind::Rar => false, // external tool only; async path handles it
+    }
+}
+
+/// Recursively collect every file under `dir`.
+fn collect_all_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+            if name == "__MACOSX" {
+                continue;
+            }
+            collect_all_files(&path, out);
+        } else {
+            let name = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+            if !name.starts_with("._") {
+                out.push(path);
+            }
+        }
+    }
+}
+
+/// If `dir` contains exactly one subdirectory (and no loose files), move
+/// its contents up into `dir` and drop it - so a bundle's own
+/// "Artist - Album/" wrapper doesn't nest inside the library folder.
+fn flatten_single_top_dir(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let entries: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    if entries.len() != 1 || !entries[0].is_dir() {
+        return;
+    }
+    let inner = &entries[0];
+    let Ok(children) = std::fs::read_dir(inner) else {
+        return;
+    };
+    for child in children.flatten() {
+        let from = child.path();
+        let to = dir.join(child.file_name());
+        if to.exists() {
+            continue;
+        }
+        let _ = std::fs::rename(&from, &to);
+    }
+    // Remove if empty (a leftover nested dir means a name collision).
+    let _ = std::fs::remove_dir(inner);
+}
+
+/// Natural track ordering key: disc folder, then leading "NN." number,
+/// then filename - so "02. questioning" sorts after "01. lose the rain"
+/// and "10." after "09." (lexicographic would put "10" before "2").
+fn track_sort_key(p: &Path) -> (String, u64, String) {
+    let dir = p
+        .parent()
+        .map(|d| d.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let stem = p
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let trimmed = stem.trim_start();
+    let num = trimmed
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
+    let n = num.parse::<u64>().unwrap_or(u64::MAX);
+    (dir, n, stem.to_lowercase())
+}
+
+/// Sort audio files into release order (see `track_sort_key`).
+pub fn sort_tracks_naturally(paths: &mut [PathBuf]) {
+    paths.sort_by(|a, b| {
+        let ka = track_sort_key(a);
+        let kb = track_sort_key(b);
+        ka.cmp(&kb)
+    });
+}
+
 /// A download event sent to the TUI. The TUI subscribes to a channel and
 /// renders these as they happen.
 #[derive(Debug, Clone)]
@@ -238,6 +419,24 @@ pub enum DownloadEvent {
     Log {
         level: LogLevel,
         message: String,
+    },
+    /// Album item lifecycle for machine consumers: one pair per track
+    /// (`picaro item-start <name>` / `picaro item-done <name> <path>`),
+    /// also fired for tracks unpacked from a release bundle.
+    ItemStarted {
+        name: String,
+    },
+    ItemDone {
+        name: String,
+        location: PathBuf,
+    },
+    /// Quality step-down announcement: the request wanted `requested` but
+    /// the winning source only serves `served` (`picaro tier <req> <got>`).
+    /// Always emitted BEFORE the download proceeds - a UI must be able to
+    /// warn instead of silently receiving a lower tier.
+    TierNotice {
+        requested: String,
+        served: String,
     },
     Finished {
         service: String,
@@ -619,6 +818,9 @@ impl Downloader {
         // Drop <100KB results as corrupted-at-source, like Python does.
         check_min_size(&dest, bytes).await?;
         if !picaro_utils::safety::looks_like_audio(&dest) {
+            // A rejected download must clean up after itself - this path
+            // once left a 344MB archive mislabeled as .flac on disk.
+            let _ = std::fs::remove_file(&dest);
             return Err(Error::Download(format!(
                 "rejected non-audio download (bad source?): {}",
                 dest.display()
@@ -905,8 +1107,21 @@ impl Downloader {
         // archive holding every track (e.g. CoreRadio's per-album 7z), so keep
         // everything it extracts rather than just the first song.
         let single_archive = album.tracks.len() == 1;
-        for track in &album.tracks {
+        for (idx, track) in album.tracks.iter().enumerate() {
             let id = track.id();
+            let item_name = match track {
+                TrackRef::Full(f) => f.name.clone(),
+                TrackRef::Id(_) => {
+                    if single_archive {
+                        album.name.clone()
+                    } else {
+                        format!("{} track {}", album.name, idx + 1)
+                    }
+                }
+            };
+            let _ = self.events.0.send(DownloadEvent::ItemStarted {
+                name: item_name.clone(),
+            });
             // Build a per-track filename inside the album folder
             let global_album = self.globals();
             match self
@@ -923,10 +1138,31 @@ impl Downloader {
                         let mut found = Vec::new();
                         collect_audio_files(&dir, &mut found);
                         if found.len() > 1 {
+                            sort_tracks_naturally(&mut found);
+                            for f in &found {
+                                let name = f
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let _ = self.events.0.send(DownloadEvent::ItemDone {
+                                    name,
+                                    location: f.clone(),
+                                });
+                            }
                             paths.extend(found);
                             continue;
                         }
                     }
+                    let done_name = p
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&item_name)
+                        .to_string();
+                    let _ = self.events.0.send(DownloadEvent::ItemDone {
+                        name: done_name,
+                        location: p.clone(),
+                    });
                     paths.push(p);
                 }
                 Err(Error::Download(s))
@@ -951,7 +1187,266 @@ impl Downloader {
             skipped,
             failed,
         });
+        // Tracks land in release order so a UI can report them as an
+        // ordered list ("01. ..." before "02. ...", "10." after "09.").
+        sort_tracks_naturally(&mut paths);
         Ok(paths)
+    }
+
+    /// Download one track out of a BUNDLE release (an album whose module
+    /// reports a single download id that is really a 7z/zip/rar holding
+    /// every track). Downloads the bundle once, extracts it, picks the
+    /// track at 1-based `pos` in natural release order, verifies it
+    /// against `expected_secs` when known, names and tags it, and DELETES
+    /// the archive and every other extracted file afterwards.
+    pub async fn download_track_from_bundle(
+        &self,
+        service: &str,
+        info: &AlbumInfo,
+        pos: u32,
+        expected_secs: Option<u64>,
+    ) -> Result<PathBuf> {
+        let module = self.picaro.load_module(service).await?;
+        let globals = self.globals();
+        let quality = self.picaro.current_quality();
+        let codec_options = self.picaro.codec_options();
+        let Some(bundle_id) = info.tracks.first().map(|t| t.id().to_string()) else {
+            return Err(Error::Download("release has no download id".into()));
+        };
+        let bundle_name = info.name.clone();
+        let _ = self.events.0.send(DownloadEvent::TrackStarted {
+            service: service.to_string(),
+            track_id: bundle_id.clone(),
+            name: bundle_name.clone(),
+        });
+        let download = module
+            .get_track_download(&bundle_id, quality, &codec_options, HashMap::new())
+            .await?;
+        // Stage the bundle under temp/ - a rejected bundle must never sit
+        // in the download dir with a plausible name.
+        let staged = match download.download_type {
+            DownloadSource::Url => {
+                let url = download.file_url.ok_or_else(|| {
+                    Error::Download("module returned URL but no file_url".to_string())
+                })?;
+                let staged = crate::http::create_temp_filename_with_ext("bundle");
+                let mut headers = reqwest::header::HeaderMap::new();
+                for (k, v) in download.file_url_headers.iter() {
+                    if let (Ok(name), Ok(value)) = (
+                        reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                        reqwest::header::HeaderValue::from_str(v.as_str().unwrap_or("")),
+                    ) {
+                        headers.insert(name, value);
+                    }
+                }
+                let client = reqwest::Client::new();
+                let referer = headers
+                    .get(reqwest::header::REFERER)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let resolved = crate::hosters::resolve(&client, &url, &referer).await;
+                let headers = if resolved.is_some() {
+                    reqwest::header::HeaderMap::new()
+                } else {
+                    headers
+                };
+                let url = resolved.unwrap_or(url);
+                download_to_path(
+                    &client,
+                    &url,
+                    &staged,
+                    Some(headers),
+                    DownloadProgress::reporting(
+                        self.events.0.clone(),
+                        bundle_id.clone(),
+                        bundle_name.clone(),
+                    ),
+                )
+                .await?;
+                staged
+            }
+            // Module staged the bundle itself; use it directly.
+            DownloadSource::TempFilePath | DownloadSource::Mpd => download
+                .temp_file_path
+                .ok_or_else(|| Error::Download("module returned temp path but none set".to_string()))?,
+        };
+        // Cleanup closure: bundle + extraction dir.
+        let work_dir = staged.with_extension("extracted");
+        let cleanup = |staged: &Path, work: &Path| {
+            let _ = std::fs::remove_file(staged);
+            let _ = std::fs::remove_dir_all(work);
+        };
+        let Some(kind) = detect_archive(&staged) else {
+            // Not an archive: a genuine single-file release. Treat the
+            // staged file as the chosen track.
+            if !picaro_utils::safety::looks_like_audio(&staged) {
+                let msg = format!(
+                    "rejected non-audio download (bad source?): {}",
+                    staged.display()
+                );
+                cleanup(&staged, &work_dir);
+                return Err(Error::Download(msg));
+            }
+            let result = self
+                .finish_bundle_track(
+                    &staged, info, pos, expected_secs, &globals, &module, None,
+                )
+                .await;
+            if result.is_err() {
+                cleanup(&staged, &work_dir);
+            } else {
+                let _ = std::fs::remove_file(&staged);
+            }
+            return result;
+        };
+        extract_archive_of_kind(&staged, kind, &work_dir).await?;
+        postprocess_extraction(&work_dir);
+        let _ = std::fs::remove_file(&staged);
+        let mut audio = Vec::new();
+        collect_audio_files(&work_dir, &mut audio);
+        sort_tracks_naturally(&mut audio);
+        let Some(chosen) = audio.get((pos.max(1) as usize).saturating_sub(1)).cloned() else {
+            let msg = format!(
+                "{} extracted {} track(s) (position {pos} requested)",
+                info.name,
+                audio.len()
+            );
+            cleanup(&staged, &work_dir);
+            return Err(Error::Download(msg));
+        };
+        let rest: Vec<PathBuf> = audio.into_iter().filter(|p| *p != chosen).collect();
+        let result = self
+            .finish_bundle_track(&chosen, info, pos, expected_secs, &globals, &module, Some(&rest))
+            .await;
+        if result.is_err() {
+            cleanup(&staged, &work_dir);
+        } else {
+            // Success: drop the archive and the other extracted files.
+            let _ = std::fs::remove_file(&staged);
+            let _ = std::fs::remove_dir_all(&work_dir);
+        }
+        result
+    }
+
+    /// Shared tail of `download_track_from_bundle`: verify duration,
+    /// build the library filename, tag, and move `chosen` into place.
+    /// `rest` (when present) is deleted only on success.
+    async fn finish_bundle_track(
+        &self,
+        chosen: &Path,
+        info: &AlbumInfo,
+        pos: u32,
+        expected_secs: Option<u64>,
+        globals: &GlobalSettings,
+        module: &Arc<dyn picaro_utils::module::ModuleInterface>,
+        rest: Option<&[PathBuf]>,
+    ) -> Result<PathBuf> {
+        // Duration fingerprint (W2): a wildly-off duration means the
+        // source served the wrong song - reject and let the caller clean up.
+        if let Some(exp) = expected_secs {
+            crate::fingerprint::verify_expected_duration(chosen, exp)?;
+        }
+        let ext = chosen
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("flac")
+            .to_ascii_lowercase();
+        let codec = match ext.as_str() {
+            "flac" => CodecFlags::FLAC,
+            "mp3" => CodecFlags::MP3,
+            "m4a" | "mp4" => CodecFlags::AAC,
+            "ogg" | "oga" => CodecFlags::VORBIS,
+            "opus" => CodecFlags::OPUS,
+            "wav" => CodecFlags::WAV,
+            _ => CodecFlags::FLAC,
+        };
+        // "02. questioning" -> "questioning"
+        let raw_stem = chosen
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let title = raw_stem
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .trim_start_matches(['.', ')', ' ', '-'])
+            .trim();
+        let title = if title.is_empty() {
+            raw_stem.clone()
+        } else {
+            title.to_string()
+        };
+        let mut track_info = TrackInfo {
+            name: title.to_string(),
+            album: info.name.clone(),
+            artists: vec![info.artist.clone()],
+            tags: Tags {
+                track_number: Some(pos),
+                disc_number: Some(1),
+                release_date: (info.release_year > 0)
+                    .then(|| format!("{}-01-01", info.release_year)),
+                ..Default::default()
+            },
+            codec,
+            release_year: info.release_year,
+            cover_url: info.cover_url.clone().unwrap_or_default(),
+            ..Default::default()
+        };
+        if globals.get_bool_or("metadata", "fill_misc", true) {
+            let client = reqwest::Client::new();
+            let _ = picaro_utils::metadata_fill::fill_track_metadata(&client, &mut track_info)
+                .await;
+        }
+        let cover_path = self
+            .download_track_cover(module, &track_info, globals)
+            .await
+            .ok();
+        let filename = build_track_filename(globals, &track_info, &ext, true)?;
+        let dest = self.output_path.join(&filename);
+        if dest.exists() && !globals.get_bool_or("advanced", "ignore_existing_files", false) {
+            let _ = self.events.0.send(DownloadEvent::TrackSkipped {
+                track_id: info.id.clone().unwrap_or_default(),
+                name: track_info.name.clone(),
+                location: dest.clone(),
+            });
+            return Ok(dest);
+        }
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        if tokio::fs::rename(chosen, &dest).await.is_err() {
+            tokio::fs::copy(chosen, &dest).await?;
+            let _ = tokio::fs::remove_file(chosen).await;
+        }
+        let container = container_for_extension(&ext);
+        let meta_sep = globals.get_str_or("formatting", "metadata_separator", ";");
+        let split_meta = globals.get_bool_or("formatting", "split_metadata", true);
+        let mut tagger = Tagger::new(&track_info, container)
+            .with_path(&dest)
+            .with_separator(&meta_sep)
+            .with_split(split_meta);
+        if let Some(c) = &cover_path {
+            tagger = tagger.with_image(c);
+        }
+        if let Err(e) = tagger.write() {
+            self.log_warn(format!("tagging failed: {e}"));
+        }
+        if let Some(c) = &cover_path {
+            let _ = std::fs::remove_file(c);
+        }
+        if let Some(rest) = rest {
+            for p in rest {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        let bytes = tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0);
+        let _ = self.events.0.send(DownloadEvent::TrackSucceeded {
+            track_id: info.id.clone().unwrap_or_default(),
+            name: track_info.name.clone(),
+            location: dest.clone(),
+            bytes,
+        });
+        Ok(dest)
     }
 
     async fn download_track_into(
@@ -1205,76 +1700,17 @@ impl Downloader {
             }
         };
 
-        if is_7z_archive(&dest).await {
+        // A release bundle (7z/zip/rar) holding every track: extract it,
+        // expand nested archives, purge junk (cover art stays), flatten
+        // the wrapper folder, and hand back the first audio file - the
+        // album loop then keeps everything it extracted.
+        if let Some(kind) = detect_archive(&dest) {
             let extract_to = dest
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| self.output_path.clone());
-            sevenz_rust::decompress_file(&dest, &extract_to)
-                .map_err(|e| Error::Download(format!("7z extraction failed: {e}")))?;
-            let removed = picaro_utils::safety::purge_non_audio(&extract_to);
-            if !removed.is_empty() {
-                self.log_warn(format!(
-                    "removed {} non-audio file(s) from archive",
-                    removed.len()
-                ));
-            }
-            let _ = tokio::fs::remove_file(&dest).await;
-            if let Some(c) = &cover_path {
-                let _ = std::fs::remove_file(c);
-            }
-            if let Some(p) = find_first_audio(&extract_to) {
-                let _ = self.events.0.send(DownloadEvent::TrackSucceeded {
-                    track_id: track_id.to_string(),
-                    name: track_info.name.clone(),
-                    location: p.clone(),
-                    bytes,
-                });
-                return Ok(p);
-            }
-            return Ok(extract_to);
-        }
-        if is_zip_archive(&dest) {
-            let extract_to = dest
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| self.output_path.clone());
-            extract_zip(&dest, &extract_to).await?;
-            let removed = picaro_utils::safety::purge_non_audio(&extract_to);
-            if !removed.is_empty() {
-                self.log_warn(format!(
-                    "removed {} non-audio file(s) from archive",
-                    removed.len()
-                ));
-            }
-            let _ = tokio::fs::remove_file(&dest).await;
-            if let Some(c) = &cover_path {
-                let _ = std::fs::remove_file(c);
-            }
-            if let Some(p) = find_first_audio(&extract_to) {
-                let _ = self.events.0.send(DownloadEvent::TrackSucceeded {
-                    track_id: track_id.to_string(),
-                    name: track_info.name.clone(),
-                    location: p.clone(),
-                    bytes,
-                });
-                return Ok(p);
-            }
-            return Ok(extract_to);
-        }
-        if is_rar_archive(&dest) {
-            let extract_to = dest
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| self.output_path.clone());
-            extract_rar(&dest, &extract_to).await?;
-            let removed = picaro_utils::safety::purge_non_audio(&extract_to);
-            if !removed.is_empty() {
-                self.log_warn(format!(
-                    "removed {} non-audio file(s) from archive",
-                    removed.len()
-                ));
-            }
+            extract_archive_of_kind(&dest, kind, &extract_to).await?;
+            postprocess_extraction(&extract_to);
             let _ = tokio::fs::remove_file(&dest).await;
             if let Some(c) = &cover_path {
                 let _ = std::fs::remove_file(c);
@@ -1294,6 +1730,8 @@ impl Downloader {
         // Drop <100KB results as corrupted-at-source, like Python does.
         check_min_size(&dest, bytes).await?;
         if !picaro_utils::safety::looks_like_audio(&dest) {
+            // Rejected downloads clean up after themselves.
+            let _ = std::fs::remove_file(&dest);
             return Err(Error::Download(format!(
                 "rejected non-audio download (bad source?): {}",
                 dest.display()
