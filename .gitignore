@@ -4,6 +4,7 @@ target/
 # runtime data — may contain credentials and downloaded media.
 # Keep settings/logins LOCAL; never commit them.
 config/
+appconfig/
 downloads/
 cache/
 temp/

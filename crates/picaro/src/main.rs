@@ -192,6 +192,20 @@ enum Command {
         #[arg(short, long)]
         service: Option<String>,
     },
+
+    /// Transcode ONE existing local audio file to a lossy tier — the
+    /// `[conversion]` block's ffmpeg table as a standalone operation.
+    /// The result lands next to the input with the target extension and is
+    /// kept only when it actually shrank; the input is never modified.
+    /// Success prints `Converted: <path>`.
+    Convert {
+        /// The local file to convert.
+        input: PathBuf,
+        /// Target quality: high|medium|low (lossless is not a re-encode
+        /// target).
+        #[arg(short, long, default_value = "high")]
+        quality: String,
+    },
 }
 
 fn init_logging() {
@@ -835,6 +849,26 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         println!("error: {e}");
                         std::process::exit(1);
                     }
+                }
+            }
+        }
+        Command::Convert { input, quality } => {
+            // Machine grammar, same as every CLI path: `Converted: <path>`
+            // on success, `error: ...` + non-zero exit on failure.
+            let kbps = match quality.as_str() {
+                "high" => 256,
+                "medium" => 192,
+                "low" => 128,
+                other => {
+                    println!("error: unknown quality '{other}' (high|medium|low; lossless is not a re-encode target)");
+                    std::process::exit(2);
+                }
+            };
+            match picaro_downloader::downloader::convert_local_file(&input, "aac", kbps).await {
+                Ok(out) => println!("Converted: {}", out.display()),
+                Err(e) => {
+                    println!("error: {e}");
+                    std::process::exit(1);
                 }
             }
         }

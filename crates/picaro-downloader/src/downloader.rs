@@ -991,8 +991,7 @@ impl Downloader {
     /// Optionally transcode a finished file to a target codec/bitrate via
     /// ffmpeg. Configured under `[conversion]`; off by default. Returns the
     /// (possibly new) path; on any failure the original file is kept.
-    async fn maybe_convert(&self, dest: PathBuf, globals: &GlobalSettings) -> PathBuf {
-        if !globals.get_bool_or("conversion", "enabled", false) {
+    async fn maybe_convert(&self, dest: PathBuf, globals: &GlobalSettings) -> PathBuf {        if !globals.get_bool_or("conversion", "enabled", false) {
             return dest;
         }
         let codec = globals
@@ -2381,4 +2380,80 @@ pub async fn download_queue(
         }
     }
     out
+}
+
+/// Transcode ONE existing local audio file to a lossy codec/bitrate via
+/// ffmpeg — the `[conversion]` block's encoder table (`maybe_convert`) as a
+/// standalone operation, for callers that need to shrink a file they already
+/// own (the player's "redownload at a lower tier" arm reaches for this when
+/// a track can't be fetched fresh). The result lands next to the input with
+/// the target extension and is kept only when it actually shrank the audio;
+/// the input is never modified.
+pub async fn convert_local_file(
+    input: &Path,
+    codec: &str,
+    kbps: u32,
+) -> anyhow::Result<PathBuf> {
+    if !input.is_file() {
+        anyhow::bail!("no such file: {}", input.display());
+    }
+    let target_ext = match codec {
+        "aac" | "m4a" => "m4a",
+        "mp3" => "mp3",
+        "opus" => "opus",
+        "ogg" | "vorbis" => "ogg",
+        _ => anyhow::bail!("unknown codec '{codec}'"),
+    };
+    let cur_ext = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if cur_ext == target_ext {
+        anyhow::bail!("already {target_ext} — a same-codec pass gains nothing");
+    }
+    let out = input.with_extension(target_ext);
+    if out.exists() {
+        anyhow::bail!("target already exists: {}", out.display());
+    }
+    let Some(ffmpeg) = picaro_utils::util::locate_ffmpeg(None) else {
+        anyhow::bail!("ffmpeg not found");
+    };
+    let encoder = match codec {
+        "aac" | "m4a" => "aac",
+        "mp3" => "libmp3lame",
+        "opus" => "libopus",
+        "ogg" | "vorbis" => "libvorbis",
+        _ => "aac",
+    };
+    let mut cmd = tokio::process::Command::new(&ffmpeg);
+    cmd.arg("-y")
+        .arg("-i")
+        .arg(input)
+        .arg("-map_metadata")
+        .arg("0")
+        .arg("-vn")
+        .arg("-c:a")
+        .arg(encoder);
+    if kbps > 0 {
+        cmd.arg("-b:a").arg(format!("{kbps}k"));
+    }
+    cmd.arg(&out);
+    match cmd.status().await {
+        Ok(s) if s.success() => {}
+        _ => {
+            let _ = tokio::fs::remove_file(&out).await;
+            anyhow::bail!("ffmpeg failed for {}", input.display());
+        }
+    }
+    // Only keep the transcode if it actually reduced the size (same rule as
+    // the download pipeline's `only_if_larger`): a 50MB FLAC converting to
+    // a 50MB MP3 is a bug, not a save.
+    let so = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(u64::MAX);
+    let si = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
+    if so >= si {
+        let _ = tokio::fs::remove_file(&out).await;
+        anyhow::bail!("transcode wasn't smaller ({so}B >= {si}B) — keeping the original");
+    }
+    Ok(out)
 }
