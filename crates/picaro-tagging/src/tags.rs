@@ -159,16 +159,29 @@ impl<'a> Tagger<'a> {
         if let Some(dd) = self.track.tags.total_discs {
             tag.set_disk_total(dd);
         }
-        if let Some(rd) = &self.track.tags.release_date {
-            tag.set_year(
-                rd.chars()
-                    .take(4)
-                    .collect::<String>()
-                    .parse::<u32>()
-                    .unwrap_or(0),
-            );
+        // Only write a year when it's a plausible one. `0`/`0000` frames
+        // are exactly what makes strict ID3 timestamp parsers (lofty
+        // 0.22+ — and every reader built on it, like Verdania's library
+        // scan and download organizer) reject the ENTIRE file, tags and
+        // all: the real title/artist then look absent and the file gets
+        // misfiled. A missing year is harmless; a broken one is not.
+        // Drop any pre-existing (possibly invalid) year frames first, so
+        // re-tagging a source file can't carry the broken frame through.
+        tag.remove_key(&ItemKey::Year);
+        tag.remove_key(&ItemKey::RecordingDate);
+        let year = if let Some(rd) = &self.track.tags.release_date {
+            rd.chars()
+                .take(4)
+                .collect::<String>()
+                .parse::<u32>()
+                .ok()
+        } else if self.track.release_year > 0 {
+            Some(self.track.release_year as u32)
         } else {
-            tag.set_year(self.track.release_year.max(0) as u32);
+            None
+        };
+        if let Some(y) = year.filter(|y| (1000..=9999).contains(y)) {
+            tag.set_year(y);
         }
         if let Some(c) = &self.track.tags.copyright {
             tag.insert_text(ItemKey::CopyrightMessage, c.clone());
