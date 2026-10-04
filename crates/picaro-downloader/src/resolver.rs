@@ -18,6 +18,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -68,6 +69,7 @@ pub struct Resolver {
     allow_mixed_quality: bool,
     allow: Option<Vec<String>>,
     tier_order: HashMap<QualityTier, Vec<String>>,
+    source_fallback: bool,
 }
 
 /// Speed/failure history for one P2P service.
@@ -144,6 +146,10 @@ impl Resolver {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        // Retry the next source when one fails, instead of failing the
+        // whole download. Default on; `[resolver] source_fallback = false`
+        // or `--no-source-fallback` turns it back into fail-fast.
+        let source_fallback = g.get_bool_or("resolver", "source_fallback", true);
         Self {
             picaro,
             scores,
@@ -158,7 +164,21 @@ impl Resolver {
             allow_mixed_quality,
             allow,
             tier_order,
+            source_fallback,
         }
+    }
+
+    /// Fail-fast (`false`) or try-every-candidate (`true`, the default)
+    /// when a source's fetch or download fails. Mirrors the
+    /// `[resolver] source_fallback` config key; the CLI flag overrides it
+    /// per invocation.
+    pub fn set_source_fallback(&mut self, on: bool) {
+        self.source_fallback = on;
+    }
+
+    /// Whether failed sources fall through to the next candidate.
+    pub fn source_fallback(&self) -> bool {
+        self.source_fallback
     }
 
     /// Benchmark-derived default provider order for a tier (all no-signin).
@@ -472,6 +492,162 @@ impl Resolver {
             )));
         }
         Err(Error::Other(format!("resolver: no source has '{query}'")))
+    }
+
+    /// Resolve `query` to EVERY provider with a relevant hit, in priority
+    /// order (same tier loop and scoring as `resolve`, but nothing stops
+    /// at the first hit). Backs the source-fallback retry: when one
+    /// source's fetch or download fails, the caller walks this list
+    /// instead of failing outright. Only used on the failure path —
+    /// `resolve` stays the fast path.
+    pub async fn resolve_all(&mut self, query: &str, tier: QualityTier) -> Result<Vec<Resolution>> {
+        let mut out: Vec<Resolution> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for t in tier.fallback_order() {
+            if !self.allow_mixed_quality && t.rank() < tier.rank() {
+                continue;
+            }
+            for chunk in self.chain_for(t).chunks(self.max_parallel.max(1)) {
+                let batch: Vec<String> = chunk.to_vec();
+                let (hits, obs) = self.race_all(t, query, &batch).await;
+                for (s, dt, ok) in obs {
+                    self.record(&s, dt, ok);
+                }
+                for r in hits {
+                    if seen.insert(r.service.clone()) {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            // Identical errors to `resolve`, so callers see no difference.
+            if !self.allow_mixed_quality {
+                return Err(Error::Other(format!(
+                    "wanted {}, no source has '{}' at that tier (allow_mixed_quality=false)",
+                    tier.as_str(),
+                    query
+                )));
+            }
+            return Err(Error::Other(format!("resolver: no source has '{query}'")));
+        }
+        save_scores(&self.scores_path, &self.scores);
+        Ok(out)
+    }
+
+    /// `race`, but the wave runs to completion and returns every
+    /// qualifying hit (arrival order) instead of the first one. Same
+    /// per-service search, scoring and gates — only the early return is
+    /// gone.
+    async fn race_all(
+        &self,
+        tier: QualityTier,
+        query: &str,
+        services: &[String],
+    ) -> (Vec<Resolution>, Vec<(String, f64, bool)>) {
+        let mut hits = Vec::new();
+        let mut obs = Vec::new();
+        let mut futs = FuturesUnordered::new();
+        for s in services {
+            let service = s.clone();
+            let q = query.to_string();
+            let picaro = self.picaro.clone();
+            let to = if tier == QualityTier::Lossless {
+                self.timeout_lossless
+            } else {
+                self.timeout
+            };
+            // Soulseek is P2P: its own search waits ~15s for peers to
+            // answer, so the 4s probe would kill it before any results.
+            let to = if service == "soulseek" {
+                to.max(std::time::Duration::from_secs(25))
+            } else {
+                to
+            };
+            let min_match = self.min_match;
+            // Torrent viability gate: a magnet with no seeders is a dead
+            // end that would hang the engine - never pick one below
+            // [torrent] min_seeders. PirateBay carries the count in
+            // `extra_kwargs.seeders`.
+            let min_seeders: u64 = self
+                .picaro
+                .merged_globals
+                .get("torrent")
+                .and_then(|v| v.get("min_seeders"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5);
+            futs.push(async move {
+                let start = Instant::now();
+                let res = tokio::time::timeout(to, async {
+                    let m = picaro.load_module(&service).await.ok()?;
+                    // 25, not 8: weak-search modules (blogspot labels,
+                    // DLE recency sidebars) push real matches deep into
+                    // the result list; search returns metadata only, so
+                    // a full page is cheap.
+                    let results = m.search(DownloadType::track, &q, None, 25).await.ok()?;
+                    let mut best: Option<(f64, SearchResult)> = None;
+                    for r in results {
+                        let seeders = r
+                            .extra_kwargs
+                            .get("seeders")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(u64::MAX);
+                        if seeders < min_seeders {
+                            continue;
+                        }
+                        let s = score_result(&q, &r);
+                        if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
+                            best = Some((s, r));
+                        }
+                    }
+                    // Many sites phrase-match the " - " separator and
+                    // return nothing for "artist - title" queries; retry
+                    // once with plain words (scored against the original
+                    // query) before giving up on this service.
+                    let weak = best
+                        .as_ref()
+                        .map_or(true, |(s, _)| *s < min_match);
+                    if weak && q.contains(" - ") {
+                        let alt = q.replace(" - ", " ");
+                        if let Ok(more) = m.search(DownloadType::track, &alt, None, 25).await {
+                            for r in more {
+                                let s = score_result(&q, &r);
+                                if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
+                                    best = Some((s, r));
+                                }
+                            }
+                        }
+                    }
+                    match best {
+                        Some((s, r)) if s >= min_match => Some((
+                            r.result_id,
+                            r.name.unwrap_or_default(),
+                            r.artists.unwrap_or_default(),
+                            s,
+                        )),
+                        _ => None,
+                    }
+                })
+                .await;
+                (service, start.elapsed().as_secs_f64(), res)
+            });
+        }
+        while let Some((service, dt, res)) = futs.next().await {
+            match res {
+                Ok(Some((result_id, name, artists, _s))) => {
+                    obs.push((service.clone(), dt, true));
+                    hits.push(Resolution {
+                        service,
+                        result_id,
+                        name,
+                        artists,
+                        tier,
+                    });
+                }
+                _ => obs.push((service, dt, false)),
+            }
+        }
+        (hits, obs)
     }
 
     /// The configured `resolver.allow_mixed_quality` semantics.
