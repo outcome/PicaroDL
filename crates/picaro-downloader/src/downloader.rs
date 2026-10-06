@@ -1443,6 +1443,29 @@ impl Downloader {
                 cleanup(&staged, &work_dir);
                 return Err(Error::Download(msg));
             }
+            // A release known to hold several tracks but served as ONE
+            // audio file is the whole album in a single rip, not a
+            // track `pos` inside it (coreradio's "(FLAC)" link is really
+            // a full-release MP3 — the complete-album incident fetched
+            // it twelve times over and delivered it raw each time).
+            // Reject so the source fallback can try a per-track source.
+            // Modules without an expected count (DLE blogs) are caught
+            // by the duration probe instead: a >25-minute "track" from
+            // a multi-file release is the rip, not a song in it.
+            let whole_rip = info.expected_track_count.map_or(false, |n| n > 1)
+                || crate::fingerprint::probe_duration_secs(&staged)
+                    .map_or(false, |s| s > 1500.0);
+            if whole_rip {
+                let msg = format!(
+                    "{} serves the whole release as one file{} \u{2014} not fetchable per-track",
+                    info.name,
+                    info.expected_track_count
+                        .map(|n| format!(" ({} tracks)", n))
+                        .unwrap_or_default()
+                );
+                cleanup(&staged, &work_dir);
+                return Err(Error::Download(msg));
+            }
             let result = self
                 .finish_bundle_track(
                     &staged, info, pos, expected_secs, &globals, &module, None,
@@ -1902,6 +1925,21 @@ impl Downloader {
                 "rejected non-audio download (bad source?): {}",
                 dest.display()
             )));
+        }
+        // A track query must never be answered with the whole album in
+        // one giant file (coreradio's "(FLAC)" search hit is a
+        // full-release MP3 the free-text fallback kept on disk).
+        // Longer than ~25 minutes is not a song; a probe we can't read
+        // stays untouched so odd containers never false-block.
+        if let Some(secs) = crate::fingerprint::probe_duration_secs(&dest) {
+            if secs > 1500.0 {
+                let _ = std::fs::remove_file(&dest);
+                return Err(Error::Download(format!(
+                    "rejected album-sized download ({:.0} min): {}",
+                    secs / 60.0,
+                    dest.display()
+                )));
+            }
         }
         if let Some(reason) = picaro_utils::safety::danger_reason(&dest) {
             let _ = std::fs::remove_file(&dest);
