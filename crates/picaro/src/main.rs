@@ -462,9 +462,14 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
                 if json {
+                    // `display_path` strips the `\\?\` verbatim prefix that
+                    // `canonicalize` adds on Windows: embedding hosts store
+                    // this path verbatim, and a `\\?\F:\...` string in their
+                    // artwork column breaks their cover lookups (Verdania's
+                    // fetch-artwork shipped exactly that to its DB).
                     println!(
                         "{{\"path\":{}, \"url\":{}, \"source\":\"{}\", \"width\":{}, \"height\":{}, \"format\":\"{}\"}}",
-                        serde_json::to_string(&abs.to_string_lossy()).unwrap(),
+                        serde_json::to_string(&display_path(&abs).to_string_lossy()).unwrap(),
                         serde_json::to_string(&hit.url).unwrap(),
                         hit.source,
                         hit.width.map(|w| w.to_string()).unwrap_or("null".into()),
