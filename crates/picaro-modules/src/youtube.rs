@@ -4,7 +4,6 @@
 //! YouTube's signing / decipher algorithms.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 
@@ -601,10 +600,10 @@ impl picaro_utils::module::ModuleInterface for YoutubeModule {
         } else {
             format!("https://www.youtube.com/watch?v={track_id}")
         };
-        let tmp = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("temp")
-            .join(format!("yt-{}.opus", uuid::Uuid::new_v4()));
+        // Stage under the system temp dir (never the process cwd — an
+        // embedded host like Verdania would find these in its own folder);
+        // same staging helper the downloader's bundle path uses.
+        let tmp = picaro_downloader::http::create_temp_filename_with_ext("opus");
         std::fs::create_dir_all(tmp.parent().unwrap()).ok();
         let output = Command::new("yt-dlp")
             .args([

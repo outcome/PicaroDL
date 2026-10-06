@@ -26,7 +26,10 @@ struct ProgressReporter {
     tx: crossbeam_channel::Sender<crate::downloader::DownloadEvent>,
     track_id: String,
     name: String,
-    sent: std::cell::Cell<u64>,
+    /// Atomic (not `Cell`) so `DownloadProgress` is `Sync`: an embedder
+    /// holding `&progress` across an await (the .part-cleanup transfer
+    /// block below does) needs the future to stay `Send`.
+    sent: std::sync::atomic::AtomicU64,
 }
 
 impl Drop for DownloadProgress {
@@ -73,7 +76,7 @@ impl DownloadProgress {
                 tx,
                 track_id,
                 name,
-                sent: std::cell::Cell::new(0),
+                sent: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -90,12 +93,12 @@ impl DownloadProgress {
         let Some(r) = &self.reporter else {
             return;
         };
-        let prev = r.sent.get();
+        let prev = r.sent.load(std::sync::atomic::Ordering::Relaxed);
         let finished = total > 0 && bytes >= total;
         if bytes != 0 && !finished && bytes < prev + 262_144 {
             return;
         }
-        r.sent.set(bytes);
+        r.sent.store(bytes, std::sync::atomic::Ordering::Relaxed);
         let _ = r.tx.send(crate::downloader::DownloadEvent::TrackProgress {
             track_id: r.track_id.clone(),
             name: r.name.clone(),
@@ -138,21 +141,35 @@ pub async fn download_to_path(
     progress.report(0, total);
     // Download to "<dest>.part" and rename on completion, so an
     // interrupted transfer never leaves a plausible-looking partial at
-    // the final name (the skip-check would then treat it as done).
+    // the final name (the skip-check would then treat it as done). A
+    // FAILED transfer removes the .part again — a host that cuts bulk
+    // links mid-stream must not litter the staging dir with corpses
+    // (the coreradio concurrent-bundle incident left eight of them).
     let part = {
         let mut p = dest.as_os_str().to_os_string();
         p.push(".part");
         PathBuf::from(p)
     };
-    let mut file = fs::File::create(&part).await?;
-    let mut bytes: u64 = 0;
-    while let Some(chunk) = resp.chunk().await? {
-        file.write_all(&chunk).await?;
-        bytes += chunk.len() as u64;
-        progress.update(chunk.len() as u64);
-        progress.report(bytes, total);
+    let transfer = async {
+        let mut file = fs::File::create(&part).await?;
+        let mut bytes: u64 = 0;
+        while let Some(chunk) = resp.chunk().await? {
+            file.write_all(&chunk).await?;
+            bytes += chunk.len() as u64;
+            progress.update(chunk.len() as u64);
+            progress.report(bytes, total);
+        }
+        file.flush().await?;
+        picaro_utils::error::Result::Ok(bytes)
     }
-    file.flush().await?;
+    .await;
+    let bytes = match transfer {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let _ = fs::remove_file(&part).await;
+            return Err(e);
+        }
+    };
     fs::rename(&part, dest).await?;
     if let Some(bar) = &progress.bar {
         if total == 0 {
@@ -162,11 +179,15 @@ pub async fn download_to_path(
     Ok(bytes)
 }
 
-/// Create a uniquely-named file inside the `temp/` dir.
+/// Create a uniquely-named file inside the picaro staging dir.
+///
+/// This lives under the SYSTEM temp dir, never the process working
+/// directory: an embedded host (Verdania runs the library in-process)
+/// would otherwise find half-finished staging files piling up inside its
+/// own repo/install folder — the complete-album run that staged eight
+/// album bundles into the player's `temp/` was exactly that.
 pub fn create_temp_filename() -> PathBuf {
-    let dir = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("temp");
+    let dir = std::env::temp_dir().join("picaro");
     let _ = std::fs::create_dir_all(&dir);
     let id: String = (0..16)
         .map(|_| {
@@ -233,5 +254,64 @@ pub fn cleanup_zero_byte(path: &Path) {
                 let _ = std::fs::remove_file(path);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn temp_filenames_live_in_the_system_temp_dir() {
+        let a = create_temp_filename();
+        let b = create_temp_filename();
+        let staging = std::env::temp_dir().join("picaro");
+        // Under the system staging dir, not the process working
+        // directory (the cwd-relative staging once left half-finished
+        // bundles inside the embedding player's own folder).
+        assert!(a.starts_with(&staging), "{a:?} not under {staging:?}");
+        assert!(b.starts_with(&staging));
+        assert_ne!(a, b, "temp names must be unique");
+        let cwd = std::env::current_dir().unwrap_or_default();
+        assert!(!a.starts_with(cwd.join("temp")));
+        let ext = create_temp_filename_with_ext("bundle");
+        assert_eq!(ext.extension().and_then(|e| e.to_str()), Some("bundle"));
+    }
+
+    #[tokio::test]
+    async fn failed_transfer_leaves_no_part_behind() {
+        // A server that promises more bytes than it sends: the transfer
+        // errors mid-body, and the .part corpse must be cleaned up.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await; // the request
+            let head = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n";
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&[b'x'; 100]).await;
+            // Drop the connection with 900 bytes still owed.
+        });
+        let dest = create_temp_filename_with_ext("bundle");
+        let part = {
+            let mut p = dest.as_os_str().to_os_string();
+            p.push(".part");
+            PathBuf::from(p)
+        };
+        let url = format!("http://{addr}/file.bundle");
+        let res = download_to_path(
+            &reqwest::Client::new(),
+            &url,
+            &dest,
+            None,
+            DownloadProgress::hidden(),
+        )
+        .await;
+        assert!(res.is_err(), "truncated body must fail");
+        assert!(!part.exists(), "the .part corpse must be removed");
+        assert!(!dest.exists(), "nothing may land at the final name");
+        let _ = server.await;
     }
 }
