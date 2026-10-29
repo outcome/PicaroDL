@@ -183,12 +183,17 @@ impl FlowError {
                 } else {
                     format!("{n} sources")
                 };
+                let (dl, every) = if n == 1 {
+                    ("the download", "the download")
+                } else {
+                    ("the downloads", "every download")
+                };
                 if !classes.is_empty() && classes.iter().all(|c| *c == "network") {
-                    format!("Found on {sources}, but the downloads failed (network errors); try again later")
+                    format!("Found on {sources}, but {dl} failed (network errors); try again later")
                 } else if classes.iter().any(|c| *c == "auth") {
                     format!("Found on {sources}, but the download needs a login that isn't set up")
                 } else {
-                    format!("Found on {sources}, but every download failed")
+                    format!("Found on {sources}, but {every} failed")
                 }
             }
         }
