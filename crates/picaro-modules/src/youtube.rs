@@ -434,16 +434,34 @@ fn collect_ytm(v: &Value, out: &mut Vec<SearchResult>, limit: usize) {
 /// InnerTune client uses). Returns real songs (title/artist/album/duration)
 /// instead of raw video titles. No login required.
 async fn ytm_search(query: &str, limit: u32) -> Result<Vec<SearchResult>> {
+    let (v, len) = ytm_request(query, None).await?;
+    let mut out = Vec::new();
+    collect_ytm(&v, &mut out, limit as usize);
+    tracing::info!("ytmusic search '{query}': len={len} items={}", out.len());
+    Ok(out)
+}
+
+/// One InnerTube search call. `params` is the protobuf filter blob (the
+/// Albums shelf, for instance); `None` is the unfiltered song-leaning search.
+/// A non-2xx reply is an empty result, not an error, so callers fall through
+/// to their next strategy. Returns the parsed reply and its byte length.
+async fn ytm_request(query: &str, params: Option<&str>) -> Result<(Value, usize)> {
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .build()
         .unwrap_or_default();
     let url =
         format!("https://music.youtube.com/youtubei/v1/search?key={YTM_KEY}&prettyPrint=false");
-    let body = json!({
+    let mut body = json!({
         "context": { "client": { "clientName": "WEB_REMIX", "clientVersion": YTM_CLIENT_VERSION, "hl": "en" } },
         "query": query
     });
+    if let Some(p) = params {
+        body["params"] = json!(p);
+        // Filtered (album) searches pin the region so the shelf is the same
+        // everywhere; the unfiltered song search keeps its IP-derived default.
+        body["context"]["client"]["gl"] = json!("US");
+    }
     let resp = client
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -455,20 +473,110 @@ async fn ytm_search(query: &str, limit: u32) -> Result<Vec<SearchResult>> {
         .await
         .map_err(|e| Error::Other(format!("ytmusic search: {e}")))?;
     if !resp.status().is_success() {
-        return Ok(Vec::new());
+        return Ok((Value::Null, 0));
     }
     let text = resp
         .text()
         .await
         .map_err(|e| Error::Other(format!("ytmusic search read: {e}")))?;
     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    Ok((v, text.len()))
+}
+
+/// InnerTube `params` blob pinning YouTube Music's Albums filter: the reply
+/// is one shelf of album / EP / single rows, each carrying its auto-generated
+/// `OLAK5uy_` playlist (the id yt-dlp can read as an album).
+const YTM_ALBUMS_FILTER: &str = "EgWKAQIYAWoKEAkQBRAKEAMQBA==";
+
+/// One YouTube Music album row as a search result. The result id is the
+/// row's `OLAK5uy_` playlist id: `get_album_info` hands it to the playlist
+/// extractor. Rows without one (artist/playlist shelves, browse-only rows)
+/// are skipped. The subtitle reads "EP • Artist & Artist • 2026": the
+/// artists are the linked runs, the year the 4-digit run.
+fn parse_ytm_album_item(item: &Value) -> Option<SearchResult> {
+    let playlist_id = item
+        .pointer("/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchPlaylistEndpoint/playlistId")
+        .and_then(|v| v.as_str())
+        .filter(|id| id.starts_with("OLAK5uy_"))?;
+    let flex = item.get("flexColumns")?.as_array()?;
+    let title = flex.first().and_then(ytm_runs_text)?;
+    let runs = flex
+        .get(1)
+        .and_then(|c| c.pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs"))
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let artists: Vec<String> = runs
+        .iter()
+        .filter(|r| r.get("navigationEndpoint").is_some())
+        .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
+        .map(|t| t.to_string())
+        .collect();
+    let year = runs
+        .iter()
+        .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
+        .map(str::trim)
+        .find(|t| t.len() == 4 && t.chars().all(|c| c.is_ascii_digit()))
+        .map(|t| t.to_string());
+    let image_url = item
+        .pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
+        .and_then(|t| t.as_array())
+        .and_then(|t| t.last())
+        .and_then(|t| t.get("url"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string());
+    Some(SearchResult {
+        result_id: playlist_id.to_string(),
+        name: Some(title),
+        artists: if artists.is_empty() { None } else { Some(artists) },
+        year,
+        image_url,
+        ..Default::default()
+    })
+}
+
+fn collect_ytm_albums(v: &Value, out: &mut Vec<SearchResult>, limit: usize) {
+    if out.len() >= limit {
+        return;
+    }
+    match v {
+        Value::Object(o) => {
+            if let Some(item) = o.get("musicResponsiveListItemRenderer") {
+                if let Some(sr) = parse_ytm_album_item(item) {
+                    out.push(sr);
+                }
+            }
+            for val in o.values() {
+                collect_ytm_albums(val, out, limit);
+                if out.len() >= limit {
+                    return;
+                }
+            }
+        }
+        Value::Array(a) => {
+            for val in a {
+                collect_ytm_albums(val, out, limit);
+                if out.len() >= limit {
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Album search through YouTube Music's Albums filter. The plain YouTube
+/// playlist search (`results?sp=EgIQAw`) surfaces fan playlists and "full
+/// album" uploads, and misses the official auto-generated album playlists
+/// YouTube Music serves — so a release that only exists there (a new EP) was
+/// "not found on any source". " - " is dropped from the query: YouTube Music
+/// treats it as a literal and ranks worse with it.
+async fn ytm_album_search(query: &str, limit: u32) -> Result<Vec<SearchResult>> {
+    let q = query.replace(" - ", " ");
+    let (v, len) = ytm_request(&q, Some(YTM_ALBUMS_FILTER)).await?;
     let mut out = Vec::new();
-    collect_ytm(&v, &mut out, limit as usize);
-    tracing::info!(
-        "ytmusic search '{query}': len={} items={}",
-        text.len(),
-        out.len()
-    );
+    collect_ytm_albums(&v, &mut out, limit as usize);
+    tracing::info!("ytmusic album search '{q}': len={len} items={}", out.len());
     Ok(out)
 }
 
@@ -887,6 +995,18 @@ impl picaro_utils::module::ModuleInterface for YoutubeModule {
                 }
             }
         }
+        // Albums: YouTube Music's own Albums shelf first. Its official
+        // `OLAK5uy_` playlists are the real releases (a brand-new EP exists
+        // nowhere else here); the playlist search below only finds fan
+        // playlists and "full album" uploads.
+        if query_type == DownloadType::album {
+            if let Ok(mut r) = ytm_album_search(query, limit).await {
+                r.truncate(limit as usize);
+                if !r.is_empty() {
+                    return Ok(r);
+                }
+            }
+        }
         // yt-dlp only implements `ytsearchN:` — there is no `ytsearchplaylist`
         // or `ytsearchchannel` scheme. Mirror youtube_api.search instead:
         // videos via `ytsearch`, playlists via a filtered results URL
@@ -1098,6 +1218,63 @@ mod tests {
             album_identity("Album - Sunset Funeral", "Glare - Topic"),
             ("Glare".to_string(), "Sunset Funeral".to_string())
         );
+    }
+
+    /// Shape of a live YouTube Music Albums-shelf row (Whirr & Luster EP).
+    fn ytm_album_row(playlist: Option<&str>) -> Value {
+        let mut row = json!({
+            "flexColumns": [
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    { "text": "Whirr & Luster" }
+                ]}}},
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    { "text": "EP" },
+                    { "text": " \u{2022} " },
+                    { "text": "Whirr", "navigationEndpoint": { "browseEndpoint": { "browseId": "UCa" } } },
+                    { "text": " & " },
+                    { "text": "Luster", "navigationEndpoint": { "browseEndpoint": { "browseId": "UCb" } } },
+                    { "text": " \u{2022} " },
+                    { "text": "2026" }
+                ]}}}
+            ],
+            "thumbnail": { "musicThumbnailRenderer": { "thumbnail": { "thumbnails": [
+                { "url": "https://example.test/small.jpg" },
+                { "url": "https://example.test/big.jpg" }
+            ]}}}
+        });
+        if let Some(id) = playlist {
+            row["overlay"] = json!({ "musicItemThumbnailOverlayRenderer": { "content": {
+                "musicPlayButtonRenderer": { "playNavigationEndpoint": {
+                    "watchPlaylistEndpoint": { "playlistId": id }
+                }}
+            }}});
+        }
+        row
+    }
+
+    #[test]
+    fn ytm_album_rows_become_search_results_keyed_by_their_olak_playlist() {
+        let r = parse_ytm_album_item(&ytm_album_row(Some("OLAK5uy_abc"))).unwrap();
+        assert_eq!(r.result_id, "OLAK5uy_abc");
+        assert_eq!(r.name.as_deref(), Some("Whirr & Luster"));
+        assert_eq!(r.artists, Some(vec!["Whirr".to_string(), "Luster".to_string()]));
+        assert_eq!(r.year.as_deref(), Some("2026"));
+        assert_eq!(r.image_url.as_deref(), Some("https://example.test/big.jpg"));
+    }
+
+    #[test]
+    fn ytm_album_rows_without_an_olak_playlist_are_skipped() {
+        assert!(parse_ytm_album_item(&ytm_album_row(None)).is_none());
+        assert!(parse_ytm_album_item(&ytm_album_row(Some("RDAMVMxyz"))).is_none());
+        // Nested anywhere in a reply, the walk still finds the good rows.
+        let reply = json!({ "contents": [
+            { "musicResponsiveListItemRenderer": ytm_album_row(None) },
+            { "x": { "musicResponsiveListItemRenderer": ytm_album_row(Some("OLAK5uy_ok")) } }
+        ]});
+        let mut out = Vec::new();
+        collect_ytm_albums(&reply, &mut out, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].result_id, "OLAK5uy_ok");
     }
 
     #[test]
