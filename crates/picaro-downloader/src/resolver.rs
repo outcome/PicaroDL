@@ -349,205 +349,35 @@ impl Resolver {
         }
     }
 
-    async fn race(
+    /// One search wave over `services` at `tier`: every service searched in
+    /// parallel (bounded by the probe timeout), each contributing its single
+    /// best-scoring result when it clears `min_match`. `first_only` returns
+    /// on the first qualifying hit (the fast `resolve` path); otherwise the
+    /// wave runs to completion and every hit comes back in arrival order.
+    /// `kind` is the search type handed to the modules (`track` for songs,
+    /// `album` for whole releases).
+    async fn wave(
         &self,
         tier: QualityTier,
         query: &str,
         services: &[String],
-    ) -> (Option<Resolution>, Vec<(String, f64, bool)>) {
-        let mut obs = Vec::new();
-        let mut futs = FuturesUnordered::new();
-        for s in services {
-            let service = s.clone();
-            let q = query.to_string();
-            let picaro = self.picaro.clone();
- let to = if tier == QualityTier::Lossless {
-  self.timeout_lossless
-  } else {
-  self.timeout
-  };
-            // Soulseek is P2P: its own search waits ~15s for peers to
-            // answer, so the 4s probe would kill it before any results.
-            let to = if service == "soulseek" {
-                to.max(std::time::Duration::from_secs(25))
-            } else {
-                to
-            };
-            let min_match = self.min_match;
-            // Torrent viability gate: a magnet with no seeders is a dead
-            // end that would hang the engine - never pick one below
-            // [torrent] min_seeders. PirateBay carries the count in
-            // `extra_kwargs.seeders`.
-            let min_seeders: u64 = self
-                .picaro
-                .merged_globals
-                .get("torrent")
-                .and_then(|v| v.get("min_seeders"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(5);
-            futs.push(async move {
-                let start = Instant::now();
-                let res = tokio::time::timeout(to, async {
-                    let m = picaro.load_module(&service).await.ok()?;
-                    // 25, not 8: weak-search modules (blogspot labels,
-                    // DLE recency sidebars) push real matches deep into
-                    // the result list; search returns metadata only, so
-                    // a full page is cheap.
-                    let results = m.search(DownloadType::track, &q, None, 25).await.ok()?;
-                    let mut best: Option<(f64, SearchResult)> = None;
-                    for r in results {
-                        let seeders = r
-                            .extra_kwargs
-                            .get("seeders")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(u64::MAX);
-                        if seeders < min_seeders {
-                            continue;
-                        }
-                        let s = score_result(&q, &r);
-                        if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
-                            best = Some((s, r));
-                        }
-                    }
-                    // Many sites phrase-match the " - " separator and
-                    // return nothing for "artist - title" queries; retry
-                    // once with plain words (scored against the original
-                    // query) before giving up on this service.
-                    let weak = best
-                        .as_ref()
-                        .map_or(true, |(s, _)| *s < min_match);
-                    if weak && q.contains(" - ") {
-                        let alt = q.replace(" - ", " ");
-                        if let Ok(more) = m.search(DownloadType::track, &alt, None, 25).await {
-                            for r in more {
-                                let s = score_result(&q, &r);
-                                if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
-                                    best = Some((s, r));
-                                }
-                            }
-                        }
-                    }
-                    match best {
-                        Some((s, r)) if s >= min_match => Some((
-                            r.result_id,
-                            r.name.unwrap_or_default(),
-                            r.artists.unwrap_or_default(),
-                            s,
-                        )),
-                        _ => None,
-                    }
-                })
-                .await;
-                (service, start.elapsed().as_secs_f64(), res)
-            });
-        }
-        while let Some((service, dt, res)) = futs.next().await {
-            match res {
-                Ok(Some((result_id, name, artists, _s))) => {
-                    obs.push((service.clone(), dt, true));
-                    return (
-                        Some(Resolution {
-                            service,
-                            result_id,
-                            name,
-                            artists,
-                            tier,
-                        }),
-                        obs,
-                    );
-                }
-                _ => obs.push((service, dt, false)),
-            }
-        }
-        (None, obs)
-    }
-
-    /// Resolve `query` to the first provider with a relevant search hit.
-    ///
-    /// With `allow_mixed_quality=false` the tier ladder never steps
-    /// DOWN: only the requested tier and higher ones are tried, and a
-    /// miss is reported instead of silently serving a lower tier.
-    pub async fn resolve(&mut self, query: &str, tier: QualityTier) -> Result<Resolution> {
-        for t in tier.fallback_order() {
-            if !self.allow_mixed_quality && t.rank() < tier.rank() {
-                continue;
-            }
-            for chunk in self.chain_for(t).chunks(self.max_parallel.max(1)) {
-                let batch: Vec<String> = chunk.to_vec();
-                let (hit, obs) = self.race(t, query, &batch).await;
-                for (s, dt, ok) in obs {
-                    self.record(&s, dt, ok);
-                }
-                if let Some(r) = hit {
-                    save_scores(&self.scores_path, &self.scores);
-                    return Ok(r);
-                }
-            }
-        }
-        if !self.allow_mixed_quality {
-            return Err(Error::Other(format!(
-                "wanted {}, no source has '{}' at that tier (allow_mixed_quality=false)",
-                tier.as_str(),
-                query
-            )));
-        }
-        Err(Error::Other(format!("resolver: no source has '{query}'")))
-    }
-
-    /// Resolve `query` to EVERY provider with a relevant hit, in priority
-    /// order (same tier loop and scoring as `resolve`, but nothing stops
-    /// at the first hit). Backs the source-fallback retry: when one
-    /// source's fetch or download fails, the caller walks this list
-    /// instead of failing outright. Only used on the failure path —
-    /// `resolve` stays the fast path.
-    pub async fn resolve_all(&mut self, query: &str, tier: QualityTier) -> Result<Vec<Resolution>> {
-        let mut out: Vec<Resolution> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for t in tier.fallback_order() {
-            if !self.allow_mixed_quality && t.rank() < tier.rank() {
-                continue;
-            }
-            for chunk in self.chain_for(t).chunks(self.max_parallel.max(1)) {
-                let batch: Vec<String> = chunk.to_vec();
-                let (hits, obs) = self.race_all(t, query, &batch).await;
-                for (s, dt, ok) in obs {
-                    self.record(&s, dt, ok);
-                }
-                for r in hits {
-                    if seen.insert(r.service.clone()) {
-                        out.push(r);
-                    }
-                }
-            }
-        }
-        if out.is_empty() {
-            // Identical errors to `resolve`, so callers see no difference.
-            if !self.allow_mixed_quality {
-                return Err(Error::Other(format!(
-                    "wanted {}, no source has '{}' at that tier (allow_mixed_quality=false)",
-                    tier.as_str(),
-                    query
-                )));
-            }
-            return Err(Error::Other(format!("resolver: no source has '{query}'")));
-        }
-        save_scores(&self.scores_path, &self.scores);
-        Ok(out)
-    }
-
-    /// `race`, but the wave runs to completion and returns every
-    /// qualifying hit (arrival order) instead of the first one. Same
-    /// per-service search, scoring and gates — only the early return is
-    /// gone.
-    async fn race_all(
-        &self,
-        tier: QualityTier,
-        query: &str,
-        services: &[String],
+        kind: DownloadType,
+        first_only: bool,
     ) -> (Vec<Resolution>, Vec<(String, f64, bool)>) {
         let mut hits = Vec::new();
         let mut obs = Vec::new();
         let mut futs = FuturesUnordered::new();
+        // Torrent viability gate: a magnet with no seeders is a dead end
+        // that would hang the engine - never pick one below
+        // [torrent] min_seeders. PirateBay carries the count in
+        // `extra_kwargs.seeders`.
+        let min_seeders: u64 = self
+            .picaro
+            .merged_globals
+            .get("torrent")
+            .and_then(|v| v.get("min_seeders"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5);
         for s in services {
             let service = s.clone();
             let q = query.to_string();
@@ -565,57 +395,44 @@ impl Resolver {
                 to
             };
             let min_match = self.min_match;
-            // Torrent viability gate: a magnet with no seeders is a dead
-            // end that would hang the engine - never pick one below
-            // [torrent] min_seeders. PirateBay carries the count in
-            // `extra_kwargs.seeders`.
-            let min_seeders: u64 = self
-                .picaro
-                .merged_globals
-                .get("torrent")
-                .and_then(|v| v.get("min_seeders"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(5);
             futs.push(async move {
                 let start = Instant::now();
                 let res = tokio::time::timeout(to, async {
                     let m = picaro.load_module(&service).await.ok()?;
+                    let mut best: Option<(f64, SearchResult)> = None;
+                    let consider = |results: Vec<SearchResult>,
+                                    best: &mut Option<(f64, SearchResult)>| {
+                        for r in results {
+                            let seeders = r
+                                .extra_kwargs
+                                .get("seeders")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(u64::MAX);
+                            if seeders < min_seeders {
+                                continue;
+                            }
+                            let s = score_result(&q, &r);
+                            if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
+                                *best = Some((s, r));
+                            }
+                        }
+                    };
                     // 25, not 8: weak-search modules (blogspot labels,
                     // DLE recency sidebars) push real matches deep into
                     // the result list; search returns metadata only, so
                     // a full page is cheap.
-                    let results = m.search(DownloadType::track, &q, None, 25).await.ok()?;
-                    let mut best: Option<(f64, SearchResult)> = None;
-                    for r in results {
-                        let seeders = r
-                            .extra_kwargs
-                            .get("seeders")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(u64::MAX);
-                        if seeders < min_seeders {
-                            continue;
-                        }
-                        let s = score_result(&q, &r);
-                        if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
-                            best = Some((s, r));
-                        }
+                    if let Ok(results) = m.search(kind, &q, None, 25).await {
+                        consider(results, &mut best);
                     }
                     // Many sites phrase-match the " - " separator and
                     // return nothing for "artist - title" queries; retry
                     // once with plain words (scored against the original
                     // query) before giving up on this service.
-                    let weak = best
-                        .as_ref()
-                        .map_or(true, |(s, _)| *s < min_match);
+                    let weak = best.as_ref().map_or(true, |(s, _)| *s < min_match);
                     if weak && q.contains(" - ") {
                         let alt = q.replace(" - ", " ");
-                        if let Ok(more) = m.search(DownloadType::track, &alt, None, 25).await {
-                            for r in more {
-                                let s = score_result(&q, &r);
-                                if best.as_ref().map_or(true, |(bs, _)| s > *bs) {
-                                    best = Some((s, r));
-                                }
-                            }
+                        if let Ok(more) = m.search(kind, &alt, None, 25).await {
+                            consider(more, &mut best);
                         }
                     }
                     match best {
@@ -643,11 +460,144 @@ impl Resolver {
                         artists,
                         tier,
                     });
+                    if first_only {
+                        return (hits, obs);
+                    }
                 }
                 _ => obs.push((service, dt, false)),
             }
         }
         (hits, obs)
+    }
+
+    /// The services a resolve of `kind` may consult at `tier`: the tier
+    /// chain, minus track-only sources when a whole release is wanted
+    /// (their "album" ids are single files, so an album flow fed one fails
+    /// or fetches the wrong thing).
+    fn chain_for_kind(&self, tier: QualityTier, kind: DownloadType) -> Vec<String> {
+        let mut chain = self.chain_for(tier);
+        if kind == DownloadType::album && self.allow.is_none() {
+            chain.retain(|s| serves_releases(s));
+            // Stream providers (YouTube playlists, SoundCloud sets) serve
+            // low-bitrate audio: they sit in the Low chain only, so a High
+            // album request reaches the FLAC sources (Lossless chain) before
+            // settling for a playlist rip.
+            if tier != QualityTier::Low {
+                chain.retain(|s| s != "youtube" && s != "soundcloud");
+            }
+        }
+        chain
+    }
+
+    fn no_source_error(&self, query: &str, tier: QualityTier) -> Error {
+        if !self.allow_mixed_quality {
+            Error::Other(format!(
+                "wanted {}, no source has '{}' at that tier (allow_mixed_quality=false)",
+                tier.as_str(),
+                query
+            ))
+        } else {
+            Error::Other(format!("resolver: no source has '{query}'"))
+        }
+    }
+
+    /// Resolve `query` to the first provider with a relevant search hit.
+    ///
+    /// With `allow_mixed_quality=false` the tier ladder never steps
+    /// DOWN: only the requested tier and higher ones are tried, and a
+    /// miss is reported instead of silently serving a lower tier.
+    pub async fn resolve(&mut self, query: &str, tier: QualityTier) -> Result<Resolution> {
+        self.resolve_kind(query, tier, DownloadType::track).await
+    }
+
+    /// `resolve`, for a whole RELEASE ("artist - album"): modules are
+    /// searched for albums and track-only sources sit out.
+    pub async fn resolve_release(&mut self, query: &str, tier: QualityTier) -> Result<Resolution> {
+        self.resolve_kind(query, tier, DownloadType::album).await
+    }
+
+    async fn resolve_kind(
+        &mut self,
+        query: &str,
+        tier: QualityTier,
+        kind: DownloadType,
+    ) -> Result<Resolution> {
+        let mut searched: HashSet<String> = HashSet::new();
+        for t in tier.fallback_order() {
+            if !self.allow_mixed_quality && t.rank() < tier.rank() {
+                continue;
+            }
+            // A service already searched at an earlier tier gave its
+            // answer; asking it again with the same query only burns time.
+            let chain: Vec<String> = self
+                .chain_for_kind(t, kind)
+                .into_iter()
+                .filter(|s| searched.insert(s.clone()))
+                .collect();
+            for chunk in chain.chunks(self.max_parallel.max(1)) {
+                let (hits, obs) = self.wave(t, query, chunk, kind, true).await;
+                for (s, dt, ok) in obs {
+                    self.record(&s, dt, ok);
+                }
+                if let Some(r) = hits.into_iter().next() {
+                    save_scores(&self.scores_path, &self.scores);
+                    return Ok(r);
+                }
+            }
+        }
+        Err(self.no_source_error(query, tier))
+    }
+
+    /// Resolve `query` to EVERY provider with a relevant hit, in priority
+    /// order (same tier loop and scoring as `resolve`, but nothing stops
+    /// at the first hit). Backs the source-fallback retry: when one
+    /// source's fetch or download fails, the caller walks this list
+    /// instead of failing outright.
+    pub async fn resolve_all(&mut self, query: &str, tier: QualityTier) -> Result<Vec<Resolution>> {
+        self.resolve_all_kind(query, tier, DownloadType::track).await
+    }
+
+    /// `resolve_all`, for a whole RELEASE (album search, track-only
+    /// sources excluded).
+    pub async fn resolve_all_releases(
+        &mut self,
+        query: &str,
+        tier: QualityTier,
+    ) -> Result<Vec<Resolution>> {
+        self.resolve_all_kind(query, tier, DownloadType::album).await
+    }
+
+    async fn resolve_all_kind(
+        &mut self,
+        query: &str,
+        tier: QualityTier,
+        kind: DownloadType,
+    ) -> Result<Vec<Resolution>> {
+        let mut out: Vec<Resolution> = Vec::new();
+        let mut searched: HashSet<String> = HashSet::new();
+        for t in tier.fallback_order() {
+            if !self.allow_mixed_quality && t.rank() < tier.rank() {
+                continue;
+            }
+            let chain: Vec<String> = self
+                .chain_for_kind(t, kind)
+                .into_iter()
+                .filter(|s| searched.insert(s.clone()))
+                .collect();
+            for chunk in chain.chunks(self.max_parallel.max(1)) {
+                let (hits, obs) = self.wave(t, query, chunk, kind, false).await;
+                for (s, dt, ok) in obs {
+                    self.record(&s, dt, ok);
+                }
+                out.extend(hits);
+            }
+        }
+        if out.is_empty() {
+            // Identical errors to `resolve`, so callers see no difference.
+            return Err(self.no_source_error(query, tier));
+        }
+        save_scores(&self.scores_path, &self.scores);
+        Ok(out)
     }
 
     /// The configured `resolver.allow_mixed_quality` semantics.
@@ -684,6 +634,9 @@ impl Resolver {
         tier: QualityTier,
         expected_secs: Option<u64>,
     ) -> Result<PathBuf> {
+        if let Some(link) = as_link(query) {
+            return self.download_link(downloader, &link).await;
+        }
         let mut last_err: Option<Error> = None;
         let min_match = self.min_match;
 
@@ -1013,6 +966,44 @@ impl Resolver {
 
         save_scores(&self.scores_path, &self.scores);
         Err(last_err.unwrap_or_else(|| Error::Other(format!("resolver: no source has '{query}'"))))
+    }
+
+    /// Download a pasted/registry LINK from the module that owns its host:
+    /// the exact item, never a text search for the URL. Album/playlist
+    /// links return their first file (the caller wanted "this link").
+    async fn download_link(&mut self, downloader: &Downloader, link: &url::Url) -> Result<PathBuf> {
+        let host = link.host_str().unwrap_or_default().to_lowercase();
+        let registry = self.picaro.registry();
+        let Some(service) = picaro_utils::url_decode::netloc_to_module(&host, registry) else {
+            return Err(Error::Other(format!("no source handles links from {host}")));
+        };
+        let service = service.to_lowercase();
+        let decoded = picaro_utils::url_decode::default_decode_url(link.as_str(), registry).ok();
+        info!("resolver: link -> {service} ({:?})", decoded.as_ref().map(|d| d.media_type));
+        let path = match decoded {
+            Some(d) if d.media_type == DownloadType::album || d.media_type == DownloadType::playlist => {
+                let files = if d.media_type == DownloadType::album {
+                    downloader.download_album(&service, &d.media_id).await?
+                } else {
+                    downloader.download_playlist(&service, &d.media_id).await?
+                };
+                files
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| Error::Download(format!("{service} produced no files for {link}")))?
+            }
+            // Track links: modules take the full URL as the track id (their
+            // own search results are URLs too), which also covers query-
+            // addressed ids like `watch?v=`.
+            _ => {
+                downloader
+                    .download_track_with_data(&service, link.as_str(), HashMap::new())
+                    .await?
+            }
+        };
+        self.record(&service, 0.5, true);
+        save_scores(&self.scores_path, &self.scores);
+        Ok(path)
     }
 
     /// The P2P attempt phase: drain the P2P search futures (started at
@@ -1346,6 +1337,41 @@ async fn search_service_hits(
     .flatten()
 }
 
+/// Whether a provider can hand back a whole RELEASE for an album search.
+///
+/// These sources ignore the search type and only ever return single files
+/// (or, for Soulseek, refuse albums outright): an album resolve that let
+/// them in picked a same-named song (or a whole-album single-file rip) as
+/// "the release", then failed in the album flow with "no tracks found on
+/// page" / "rejected album-sized download" / "does not support ability
+/// 'album'" while the real release sources never got asked.
+pub fn serves_releases(service: &str) -> bool {
+    !matches!(
+        service,
+        "zvu4it"
+            | "tancpol"
+            | "freemp3cloud"
+            | "globaldjmix"
+            | "grimearchive"
+            | "mp3zona"
+            | "mp3tut"
+            | "ccmixter"
+            | "soulseek"
+    )
+}
+
+/// `query` as a link a module can decode, when it is one: free-text
+/// resolution of a URL searches every source for the literal URL text
+/// and downloads whatever echoes it back (the wrong song, tagged with the
+/// URL as title and artist).
+fn as_link(query: &str) -> Option<url::Url> {
+    let q = query.trim();
+    if !(q.starts_with("http://") || q.starts_with("https://")) || q.contains(char::is_whitespace) {
+        return None;
+    }
+    url::Url::parse(q).ok().filter(|u| u.host_str().is_some())
+}
+
 /// Providers that resolve a single track URL directly (vs album/archive pages).
 fn is_direct_track(service: &str) -> bool {
     matches!(
@@ -1518,5 +1544,28 @@ fn save_scores(path: &Path, scores: &HashMap<String, f64>) {
     }
     if let Ok(s) = serde_json::to_string_pretty(&doc) {
         let _ = std::fs::write(path, s);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn links_are_recognised_and_text_is_not() {
+        assert!(as_link("https://www.youtube.com/watch?v=dQw4w9WgXcQ").is_some());
+        assert!(as_link("  http://example.org/a  ").is_some());
+        assert!(as_link("Knocked Loose - Counting Worms").is_none());
+        assert!(as_link("https://x.org/a b").is_none(), "free text that starts with a URL");
+    }
+
+    #[test]
+    fn release_resolves_skip_track_only_sources() {
+        for s in ["zvu4it", "tancpol", "soulseek", "mp3tut", "freemp3cloud"] {
+            assert!(!serves_releases(s), "{s} only serves single files");
+        }
+        for s in ["coreradio", "khinsider", "youtube", "internetarchive", "butterboy"] {
+            assert!(serves_releases(s), "{s} serves whole releases");
+        }
     }
 }

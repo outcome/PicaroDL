@@ -72,6 +72,26 @@ pub fn default_decode_url(
     // Find the right key/path segment. We scan the URL for each configured
     // url_constant key.
     let path = parsed.path().to_lowercase();
+    // Query-addressed media (`/watch?v=ID`, `/playlist?list=ID`): the key is
+    // the LAST path segment and the id rides a query parameter. Without
+    // this the fallback below took "watch" itself as the track id.
+    let last_segment = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    for (key, dtype) in &info.information.url_constants {
+        if last_segment == key.to_lowercase() {
+            let id = parsed
+                .query_pairs()
+                .find(|(k, _)| matches!(k.as_ref(), "v" | "list" | "id"))
+                .map(|(_, v)| v.into_owned())
+                .filter(|v| !v.is_empty());
+            if let Some(id) = id {
+                return Ok(MediaIdentification {
+                    media_type: *dtype,
+                    media_id: id,
+                    extra_kwargs: serde_json::Map::new(),
+                });
+            }
+        }
+    }
     for (key, dtype) in &info.information.url_constants {
         let key_lower = key.to_lowercase();
         if let Some(idx) = path.find(&format!("/{key_lower}/")) {

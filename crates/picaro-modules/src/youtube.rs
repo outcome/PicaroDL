@@ -472,6 +472,27 @@ async fn ytm_search(query: &str, limit: u32) -> Result<Vec<SearchResult>> {
     Ok(out)
 }
 
+/// Album artist + title for a playlist used as an album. The playlist's
+/// CREATOR is whoever uploaded the list: a fan playlist "Glare · Sunset
+/// Funeral" by "Bahar Kaya" filed the whole album under "Bahar Kaya/".
+/// Prefer the "Artist · Album" / "Artist - Album" title split, then an
+/// auto-generated "<Artist> - Topic" channel, and only then the creator.
+fn album_identity(title: &str, creator: &str) -> (String, String) {
+    let title = title.trim();
+    let title = title.strip_prefix("Album - ").unwrap_or(title);
+    for sep in [" \u{b7} ", " - ", " \u{2013} ", " \u{2014} "] {
+        if let Some((a, b)) = title.split_once(sep) {
+            let (a, b) = (a.trim(), b.trim());
+            if !a.is_empty() && !b.is_empty() {
+                return (a.to_string(), b.to_string());
+            }
+        }
+    }
+    let creator = creator.trim();
+    let artist = creator.strip_suffix(" - Topic").unwrap_or(creator);
+    (artist.to_string(), title.to_string())
+}
+
 #[async_trait]
 impl picaro_utils::module::ModuleInterface for YoutubeModule {
     fn name(&self) -> &str {
@@ -650,9 +671,10 @@ impl picaro_utils::module::ModuleInterface for YoutubeModule {
     ) -> Result<AlbumInfo> {
         // YouTube has no albums; treat as playlist (mirrors interface.py).
         let pl = self.get_playlist_info(album_id, data).await?;
+        let (artist, name) = album_identity(&pl.name, &pl.creator);
         Ok(AlbumInfo {
-            name: pl.name,
-            artist: pl.creator,
+            name,
+            artist,
             tracks: pl.tracks,
             release_year: pl.release_year,
             id: pl.id,
@@ -853,7 +875,11 @@ impl picaro_utils::module::ModuleInterface for YoutubeModule {
         let limit = limit.clamp(1, 50);
         // Prefer YouTube Music (InnerTune-style InnerTube) results for songs:
         // they carry real artist/album metadata instead of raw video titles.
-        if matches!(query_type, DownloadType::track | DownloadType::album) {
+        // Songs only: these hits are VIDEO ids, and an album search that
+        // returned them made `get_album_info` hand a video id to yt-dlp's
+        // playlist extractor ("[youtube:tab] <id>: Unable to download API
+        // page: HTTP Error 400"). Albums use the playlist search below.
+        if query_type == DownloadType::track {
             if let Ok(mut r) = ytm_search(query, limit).await {
                 r.truncate(limit as usize);
                 if !r.is_empty() {
@@ -1061,6 +1087,38 @@ pub fn register_module(registry: &picaro_utils::ModuleRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_albums_take_the_artist_from_the_title_not_the_uploader() {
+        assert_eq!(
+            album_identity("Glare \u{b7} Sunset Funeral", "Bahar Kaya"),
+            ("Glare".to_string(), "Sunset Funeral".to_string())
+        );
+        assert_eq!(
+            album_identity("Album - Sunset Funeral", "Glare - Topic"),
+            ("Glare".to_string(), "Sunset Funeral".to_string())
+        );
+    }
+
+    #[test]
+    fn query_addressed_links_decode_to_their_ids() {
+        let registry = picaro_utils::ModuleRegistry::new();
+        register_module(&registry);
+        let watch = picaro_utils::url_decode::default_decode_url(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(watch.media_type, DownloadType::track);
+        assert_eq!(watch.media_id, "dQw4w9WgXcQ");
+        let list = picaro_utils::url_decode::default_decode_url(
+            "https://music.youtube.com/playlist?list=OLAK5uy_abc",
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(list.media_type, DownloadType::playlist);
+        assert_eq!(list.media_id, "OLAK5uy_abc");
+    }
 
     #[test]
     fn parse_video_urls() {
