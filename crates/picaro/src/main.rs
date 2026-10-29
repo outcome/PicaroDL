@@ -122,6 +122,11 @@ enum Command {
         /// off (<50% / >200%) is rejected as the wrong song.
         #[arg(long)]
         expected_seconds: Option<u64>,
+        /// Fail fast on the first source's error instead of trying the
+        /// next source (same flag as get-track / get-album; hosts append
+        /// it to every download subcommand).
+        #[arg(long)]
+        no_source_fallback: bool,
     },
 
     /// Query every lyrics provider for "artist - title".
@@ -507,6 +512,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             expected_seconds,
             no_source_fallback,
         } => {
+            use picaro_downloader::flows::{self, FlowItem};
             let tier = picaro_utils::quality::QualityTier::parse(&quality).ok_or_else(|| {
                 anyhow::anyhow!("invalid quality '{quality}' (lossless|high|medium|low)")
             })?;
@@ -518,68 +524,29 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             if no_source_fallback {
                 resolver.set_source_fallback(false);
             }
-            // 1. Resolve the release (fast path: first hit wins, as before).
-            let first = match resolver.resolve(&album, tier).await {
-                Ok(r) => r,
-                Err(e) => {
-                    println!("error: {e}");
-                    std::process::exit(1);
-                }
-            };
             let downloader = make_downloader(picaro.clone(), &cli);
-            let download_dir = resolve_download_dir(&picaro, &cli);
-            match try_get_track_source(
+            match flows::get_track(
                 &picaro,
                 &downloader,
-                &download_dir,
-                &first,
+                &mut resolver,
+                &album,
                 disc,
                 pos,
+                tier,
                 expected_seconds,
             )
             .await
             {
-                Ok(()) => return Ok(()),
+                Ok(out) => {
+                    let abs = std::fs::canonicalize(&out.path).unwrap_or(out.path);
+                    println!("Downloaded: {}", display_path(&abs).display());
+                }
                 Err(e) => {
-                    if !resolver.source_fallback() {
-                        println!("error: {e}");
-                        std::process::exit(1);
-                    }
-                    println!("note: {} failed ({e}), trying next source...", first.service);
-                    let mut errors = vec![format!("{}: {e}", first.service)];
-                    let mut done = false;
-                    if let Ok(rest) = resolver.resolve_all(&album, tier).await {
-                        for r in rest.iter().filter(|r| r.service != first.service) {
-                            match try_get_track_source(
-                                &picaro,
-                                &downloader,
-                                &download_dir,
-                                r,
-                                disc,
-                                pos,
-                                expected_seconds,
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    done = true;
-                                    break;
-                                }
-                                Err(e) => {
-                                    println!(
-                                        "note: {} failed ({e}), trying next source...",
-                                        r.service
-                                    );
-                                    errors.push(format!("{}: {e}", r.service));
-                                }
-                            }
-                        }
-                    }
-                    if !done {
-                        println!("error: all sources failed: {}", errors.join(" | "));
-                        std::process::exit(1);
-                    }
-                    return Ok(());
+                    // Full per-source detail on stderr (logs); the one-line
+                    // `error:` stays the machine-readable verdict.
+                    eprintln!("{e}");
+                    println!("error: {}", e.summary(FlowItem::Track));
+                    std::process::exit(1);
                 }
             }
         }
@@ -590,6 +557,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             json,
             no_source_fallback,
         } => {
+            use picaro_downloader::flows::{self, FlowItem};
             use picaro_utils::quality::QualityTier;
 
             let tier = QualityTier::parse(&quality).ok_or_else(|| {
@@ -603,101 +571,47 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             if no_source_fallback {
                 resolver.set_source_fallback(false);
             }
-            let emit_err = |msg: String| {
-                if json {
-                    println!("{{\"error\":{}}}", serde_json::to_string(&msg).unwrap());
-                } else {
-                    println!("error: {msg}");
-                }
-                std::process::exit(1);
-            };
-            // 1. Resolve the release (fast path: first hit wins, as before).
-            let first = match resolver.resolve(&album, tier).await {
-                Ok(r) => r,
-                Err(e) => {
-                    emit_err(e.to_string());
-                    return Ok(());
-                }
-            };
             let downloader = make_downloader(picaro.clone(), &cli);
-            let download_dir = resolve_download_dir(&picaro, &cli);
-            let allow_mixed = resolver.allow_mixed_quality();
-            let report = |out: GetAlbumOutcome| {
-                if json {
-                    let jfiles: Vec<String> = out
+            match flows::get_album(&picaro, &downloader, &mut resolver, &album, tier).await {
+                Ok(out) => {
+                    let files: Vec<PathBuf> = out
                         .files
                         .iter()
-                        .map(|p| serde_json::to_string(p.to_string_lossy().as_ref()).unwrap())
+                        .map(|p| display_path(&std::fs::canonicalize(p).unwrap_or_else(|_| p.clone())))
                         .collect();
-                    println!(
-                        "{{\"album\":{}, \"service\":\"{}\", \"tier\":\"{}\", \"served\":\"{}\", \"files\":[{}]}}",
-                        serde_json::to_string(&out.name).unwrap(),
-                        out.service,
-                        tier.as_str(),
-                        out.served.as_str(),
-                        jfiles.join(",")
-                    );
-                } else {
-                    for f in &out.files {
-                        println!("Downloaded: {}", f.display());
-                    }
-                }
-            };
-            match try_get_album_source(
-                &picaro,
-                &downloader,
-                &download_dir,
-                &first,
-                tier,
-                allow_mixed,
-                json,
-            )
-            .await
-            {
-                Ok(out) => report(out),
-                Err(e) => {
-                    if !resolver.source_fallback() {
-                        emit_err(e);
-                        return Ok(());
-                    }
-                    if !json {
-                        println!("note: {} failed ({e}), trying next source...", first.service);
-                    }
-                    let mut errors = vec![format!("{}: {e}", first.service)];
-                    let mut done: Option<GetAlbumOutcome> = None;
-                    if let Ok(rest) = resolver.resolve_all(&album, tier).await {
-                        for r in rest.iter().filter(|r| r.service != first.service) {
-                            match try_get_album_source(
-                                &picaro,
-                                &downloader,
-                                &download_dir,
-                                r,
-                                tier,
-                                allow_mixed,
-                                json,
-                            )
-                            .await
-                            {
-                                Ok(out) => {
-                                    done = Some(out);
-                                    break;
-                                }
-                                Err(e) => {
-                                    if !json {
-                                        println!(
-                                            "note: {} failed ({e}), trying next source...",
-                                            r.service
-                                        );
-                                    }
-                                    errors.push(format!("{}: {e}", r.service));
-                                }
-                            }
+                    if json {
+                        let jfiles: Vec<String> = files
+                            .iter()
+                            .map(|p| serde_json::to_string(p.to_string_lossy().as_ref()).unwrap())
+                            .collect();
+                        println!(
+                            "{{\"album\":{}, \"service\":\"{}\", \"tier\":\"{}\", \"served\":\"{}\", \"failed_tracks\":{}, \"files\":[{}]}}",
+                            serde_json::to_string(&out.name).unwrap(),
+                            out.service,
+                            tier.as_str(),
+                            out.served.as_str(),
+                            out.failed_tracks,
+                            jfiles.join(",")
+                        );
+                    } else {
+                        for f in &files {
+                            println!("Downloaded: {}", f.display());
                         }
                     }
-                    match done {
-                        Some(out) => report(out),
-                        None => emit_err(format!("all sources failed: {}", errors.join(" | "))),
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    let msg = e.summary(FlowItem::Album);
+                    if json {
+                        println!(
+                            "{{\"error\":{}, \"detail\":{}}}",
+                            serde_json::to_string(&msg).unwrap(),
+                            serde_json::to_string(&e.detail()).unwrap()
+                        );
+                    } else {
+                        println!("error: {msg}");
                     }
+                    std::process::exit(1);
                 }
             }
         }
@@ -759,6 +673,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             json,
             only,
             expected_seconds,
+            no_source_fallback,
         } => {
             let tier = picaro_utils::quality::QualityTier::parse(&quality).ok_or_else(|| {
                 anyhow::anyhow!("invalid quality '{quality}' (lossless|high|medium|low)")
@@ -768,29 +683,26 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 picaro_core::loader::config_dir().join("providers.json"),
             );
             resolver.set_only(only);
+            if no_source_fallback {
+                resolver.set_source_fallback(false);
+            }
             if kind == "album" && !resolve_only {
-                // Whole-album download: resolve the best matching release,
-                // then fetch every track from it.
+                // Whole-album download: the same release flow as get-album
+                // (album search, source fallback, partial-file cleanup).
                 let downloader = make_downloader(picaro.clone(), &cli);
-                let r = resolver.resolve(&query, tier).await?;
-                println!(
-                    "album: {} [{}]",
-                    r.service,
-                    r.result_id.split('#').next().unwrap_or(&r.result_id)
-                );
-                let files = match downloader.download_album(&r.service, &r.result_id).await {
-                    Ok(f) => f,
+                match picaro_downloader::flows::get_album(&picaro, &downloader, &mut resolver, &query, tier)
+                    .await
+                {
+                    Ok(out) => {
+                        for f in out.files {
+                            println!("Downloaded: {}", f.display());
+                        }
+                    }
                     Err(e) => {
-                        println!("error: {e}");
+                        eprintln!("{e}");
+                        println!("error: {}", e.summary(picaro_downloader::flows::FlowItem::Album));
                         std::process::exit(1);
                     }
-                };
-                if files.is_empty() {
-                    println!("error: album produced no files from {}", r.service);
-                    std::process::exit(1);
-                }
-                for f in files {
-                    println!("Downloaded: {}", f.display());
                 }
             } else if resolve_only {
                 match resolver.resolve(&query, tier).await {
@@ -829,7 +741,15 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         println!("Downloaded: {}", display_path(&abs).display());
                     }
                     Err(e) => {
-                        println!("error: {e}");
+                        eprintln!("{e}");
+                        println!(
+                            "error: {}",
+                            picaro_downloader::flows::summarize_error(
+                                &e.to_string(),
+                                picaro_downloader::flows::FlowItem::Track,
+                                Some(tier)
+                            )
+                        );
                         std::process::exit(1);
                     }
                 }
@@ -963,55 +883,6 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Best tier a resolved release can actually serve, from the module's
-/// own quality metadata (falling back to track codecs / known source
-/// classes). Used by `get-album` to announce or refuse a step-down.
-fn album_served_tier(
-    info: &picaro_utils::models::AlbumInfo,
-    service: &str,
-) -> picaro_utils::quality::QualityTier {
-    use picaro_utils::quality::QualityTier;
-    let q = info
-        .quality
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if q.contains("flac")
-        || q.contains("lossless")
-        || q.contains("alac")
-        || q.contains("wav")
-        || q.contains("aiff")
-    {
-        return QualityTier::Lossless;
-    }
-    if q.contains("320") {
-        return QualityTier::High;
-    }
-    if q.contains("256") || q.contains("192") {
-        return QualityTier::Medium;
-    }
-    if q.contains("128") {
-        return QualityTier::Low;
-    }
-    // Track-listing codecs tell the truth for per-track sources.
-    for t in &info.tracks {
-        if let picaro_utils::models::TrackRef::Full(f) = t {
-            if f.codec.is_lossless() {
-                return QualityTier::Lossless;
-            }
-        }
-    }
-    // Known FLAC-first direct sources default to lossless; everything
-    // else on the no-login chain serves MP3-class audio.
-    match service {
-        "technicaldeathmetal" | "coreradio" | "ektoplazm" | "relisten" | "khinsider" => {
-            QualityTier::Lossless
-        }
-        "youtube" | "soundcloud" => QualityTier::Low,
-        _ => QualityTier::High,
-    }
-}
-
 fn fmt_of(name: &str) -> &'static str {
     match name.to_lowercase().as_str() {
         "flacmusic" | "losslessalbums" | "coreradio" | "alterportal" | "exystence"
@@ -1036,6 +907,18 @@ fn make_downloader(picaro: Arc<Picaro>, cli: &Cli) -> Arc<Downloader> {
 /// source-fallback retry loops can snapshot it per attempt and remove a
 /// failed source's partial files before trying the next one.
 fn resolve_download_dir(picaro: &Arc<Picaro>, cli: &Cli) -> PathBuf {
+ // An explicit `--download-path` is the caller's path: relative ones
+ // resolve against the CWD like every other CLI path argument. Only the
+ // settings.json value is anchored to the project root below.
+ if let Some(p) = cli.download_path.clone() {
+ let p = if p.is_absolute() {
+ p
+ } else {
+ std::env::current_dir().map(|d| d.join(&p)).unwrap_or(p)
+ };
+ std::fs::create_dir_all(&p).ok();
+ return p;
+ }
  let raw = cli
  .download_path
  .clone()
@@ -1063,234 +946,6 @@ fn resolve_download_dir(picaro: &Arc<Picaro>, cli: &Cli) -> PathBuf {
  };
  std::fs::create_dir_all(&download_path).ok();
  download_path
-}
-
-/// Every file under `dir`, recursively. Snapshot before a source attempt;
-/// anything in the after-set but not the before-set is that attempt's
-/// debris and gets removed on failure, so a half-extracted album from a
-/// dead source can't pollute the next source's output (or the host's
-/// arrived-files diff).
-fn snapshot_dir_files(dir: &std::path::Path) -> std::collections::HashSet<PathBuf> {
-    fn walk(dir: &std::path::Path, out: &mut std::collections::HashSet<PathBuf>) {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p, out);
-            } else {
-                out.insert(p);
-            }
-        }
-    }
-    let mut out = std::collections::HashSet::new();
-    walk(dir, &mut out);
-    out
-}
-
-fn remove_newcomer_files(dir: &std::path::Path, before: &std::collections::HashSet<PathBuf>) {
-    let after = snapshot_dir_files(dir);
-    for p in after.difference(before) {
-        if p.is_dir() {
-            let _ = std::fs::remove_dir_all(p);
-        } else {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-    // Prune directories the cleanup emptied (best-effort, deepest first).
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                dirs.push(p);
-            }
-        }
-    }
-    dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
-    for d in dirs {
-        let _ = std::fs::remove_dir(d);
-    }
-}
-
-/// One source attempt for `get-album`: load the module, fetch the release
-/// info, and download the whole release. `Err(message)` — never exits — so
-/// the caller can try the next source. A failed attempt's partial files
-/// are removed first.
-struct GetAlbumOutcome {
-    service: String,
-    name: String,
-    served: picaro_utils::quality::QualityTier,
-    files: Vec<PathBuf>,
-}
-
-async fn try_get_album_source(
-    picaro: &Arc<Picaro>,
-    downloader: &Arc<Downloader>,
-    download_dir: &std::path::Path,
-    r: &picaro_downloader::resolver::Resolution,
-    tier: picaro_utils::quality::QualityTier,
-    allow_mixed: bool,
-    json: bool,
-) -> Result<GetAlbumOutcome, String> {
-    let before = snapshot_dir_files(download_dir);
-    let attempt: Result<GetAlbumOutcome, String> = async {
-        // What tier does this source actually serve?
-        let module = picaro
-            .load_module(&r.service)
-            .await
-            .map_err(|e| format!("load {}: {e}", r.service))?;
-        let info = module
-            .get_album_info(&r.result_id, HashMap::new())
-            .await
-            .map_err(|e| format!("album info from {}: {e}", r.service))?;
-        let served = album_served_tier(&info, &r.service);
-        if served.rank() < tier.rank() {
-            if !allow_mixed {
-                return Err(format!(
-                    "wanted {}, {} only has {}",
-                    tier.as_str(),
-                    r.service,
-                    served.as_str()
-                ));
-            }
-            // Announce the step-down FIRST so the UI can warn. Only on
-            // the attempt that actually proceeds to downloading.
-            if !json {
-                println!("picaro tier {} {}", tier.as_str(), served.as_str());
-            }
-        }
-        // Download the whole release from this source.
-        let files = downloader
-            .download_album(&r.service, &r.result_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        let files: Vec<PathBuf> = files
-            .into_iter()
-            .filter(|p| p.is_file())
-            .map(|p| {
-                let abs = std::fs::canonicalize(&p).unwrap_or(p);
-                display_path(&abs)
-            })
-            .collect();
-        if files.is_empty() {
-            return Err(format!("album produced no files from {}", r.service));
-        }
-        Ok(GetAlbumOutcome {
-            service: r.service.clone(),
-            name: info.name.clone(),
-            served,
-            files,
-        })
-    }
-    .await;
-    if attempt.is_err() {
-        remove_newcomer_files(download_dir, &before);
-    }
-    attempt
-}
-
-/// One source attempt for `get-track`: load the module, fetch the release
-/// info, pick the addressed track and download it (with the duration
-/// fingerprint when expected). `Err(message)` — never exits — so the
-/// caller can try the next source. A failed attempt's partial files are
-/// removed first.
-async fn try_get_track_source(
-    picaro: &Arc<Picaro>,
-    downloader: &Arc<Downloader>,
-    download_dir: &std::path::Path,
-    r: &picaro_downloader::resolver::Resolution,
-    disc: u32,
-    pos: u32,
-    expected_seconds: Option<u64>,
-) -> Result<(), String> {
-    let before = snapshot_dir_files(download_dir);
-    let attempt: Result<(), String> = async {
-        // Enumerate its tracks.
-        let module = picaro
-            .load_module(&r.service)
-            .await
-            .map_err(|e| format!("load {}: {e}", r.service))?;
-        let info = module
-            .get_album_info(&r.result_id, HashMap::new())
-            .await
-            .map_err(|e| format!("album info from {}: {e}", r.service))?;
-        // A release that resolves to a SINGLE download id is usually
-        // a bundle (7z/zip/rar) holding every track - CoreRadio's
-        // per-album archive. Fetch it once, extract, and pick the track
-        // at `pos`; the archive and the rest are deleted afterwards.
-        if info.tracks.len() == 1 {
-            let p = downloader
-                .download_track_from_bundle(&r.service, &info, pos, expected_seconds)
-                .await
-                .map_err(|e| e.to_string())?;
-            let abs = std::fs::canonicalize(&p).unwrap_or(p);
-            println!("Downloaded: {}", display_path(&abs).display());
-            return Ok(());
-        }
-        // Per-track listing: pick the track at disc/pos.
-        let disc_tracks: Vec<&picaro_utils::models::TrackRef> = info
-            .tracks
-            .iter()
-            .filter(|t| match t {
-                picaro_utils::models::TrackRef::Full(f) => {
-                    f.tags.disc_number.unwrap_or(1) == disc
-                }
-                picaro_utils::models::TrackRef::Id(_) => disc == 1,
-            })
-            .collect();
-        let Some(track) = disc_tracks.get((pos.max(1) - 1) as usize) else {
-            return Err(format!(
-                "{} has {} track(s) on disc {disc} (position {pos} requested)",
-                info.name,
-                disc_tracks.len()
-            ));
-        };
-        let (track_id, track_name) = match track {
-            picaro_utils::models::TrackRef::Full(f) => {
-                (f.id.clone().unwrap_or_default(), f.name.clone())
-            }
-            picaro_utils::models::TrackRef::Id(id) => (id.clone(), String::new()),
-        };
-        let track_name = if track_name.is_empty() {
-            format!("{} track {pos}", info.name)
-        } else {
-            track_name
-        };
-        // Download it (archive containers pick the named file).
-        let mut data = HashMap::new();
-        data.insert(
-            "__track_name__".to_string(),
-            serde_json::Value::String(track_name.clone()),
-        );
-        if !info.artist.is_empty() {
-            data.insert(
-                "__artist__".to_string(),
-                serde_json::Value::String(info.artist.clone()),
-            );
-        }
-        let p = downloader
-            .download_track_with_data(&r.service, &track_id, data)
-            .await
-            .map_err(|e| e.to_string())?;
-        // Duration fingerprint (W2): a wildly-off duration means
-        // the source served the wrong song - reject it.
-        if let Some(exp) = expected_seconds {
-            if let Err(e) = picaro_downloader::fingerprint::verify_expected_duration(&p, exp) {
-                picaro_downloader::fingerprint::remove_with_sidecars(&p);
-                return Err(e.to_string());
-            }
-        }
-        let abs = std::fs::canonicalize(&p).unwrap_or(p.clone());
-        println!("Downloaded: {}", display_path(&abs).display());
-        Ok(())
-    }
-    .await;
-    if attempt.is_err() {
-        remove_newcomer_files(download_dir, &before);
-    }
-    attempt
 }
 
 /// Print download events as one parseable line each on stdout, so a host

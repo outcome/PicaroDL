@@ -2,6 +2,7 @@
 
 pub mod downloader;
 pub mod fingerprint;
+pub mod flows;
 pub mod globals;
 pub mod hosters;
 pub mod http;
