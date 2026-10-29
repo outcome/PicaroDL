@@ -1262,6 +1262,18 @@ mod tests {
         assert_eq!(r.image_url.as_deref(), Some("https://example.test/big.jpg"));
     }
 
+    /// Live (network): the real Albums shelf for a release that only exists
+    /// on YouTube Music. `cargo test -p picaro-modules --no-default-features
+    /// -- --ignored ytm_album_search_finds`
+    #[tokio::test]
+    #[ignore]
+    async fn ytm_album_search_finds_a_release_only_on_youtube_music() {
+        let hits = ytm_album_search("Whirr - Whirr & Luster", 10).await.unwrap();
+        assert!(!hits.is_empty(), "no album rows parsed from the live reply");
+        assert_eq!(hits[0].result_id, "OLAK5uy_n6Dtu-UETmoC4zVoAp76WZlykRCNUuu7E");
+        assert_eq!(hits[0].name.as_deref(), Some("Whirr & Luster"));
+    }
+
     #[test]
     fn ytm_album_rows_without_an_olak_playlist_are_skipped() {
         assert!(parse_ytm_album_item(&ytm_album_row(None)).is_none());
