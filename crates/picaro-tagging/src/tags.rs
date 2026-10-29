@@ -301,10 +301,7 @@ fn write_tags(
     if let Some(p) = image_path {
         let bytes =
             std::fs::read(p).map_err(|e| Error::TagSavingFailure(format!("read image: {e}")))?;
-        let mime = match p.extension().and_then(|e| e.to_str()) {
-            Some("png") => MimeType::Png,
-            _ => MimeType::Jpeg,
-        };
+        let mime = image_mime(&bytes, p);
         let picture = Picture::new_unchecked(PictureType::CoverFront, Some(mime), None, bytes);
         if let Some(tag) = tagged_file.primary_tag_mut() {
             tag.push_picture(picture);
@@ -406,4 +403,38 @@ pub fn audio_probe(path: &Path) -> Option<AudioProbe> {
         bit_depth: p.bit_depth(),
         sample_rate: p.sample_rate(),
     })
+}
+
+/// The embedded picture's MIME type from its magic bytes, not the temp
+/// file's extension: covers are staged as `<hash>.png` whatever the source
+/// served, so JPEG data used to be embedded labelled `image/png` (players
+/// that trust the label reject the art).
+fn image_mime(bytes: &[u8], path: &Path) -> MimeType {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        MimeType::Png
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        MimeType::Jpeg
+    } else if bytes.starts_with(b"GIF8") {
+        MimeType::Gif
+    } else if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        MimeType::Unknown("image/webp".to_string())
+    } else {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("png") => MimeType::Png,
+            _ => MimeType::Jpeg,
+        }
+    }
+}
+
+#[cfg(test)]
+mod mime_tests {
+    use super::*;
+
+    #[test]
+    fn jpeg_bytes_in_a_png_named_file_embed_as_jpeg() {
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, b'J', b'F', b'I', b'F'];
+        assert_eq!(image_mime(&jpeg, Path::new("cover.png")), MimeType::Jpeg);
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        assert_eq!(image_mime(&png, Path::new("cover.jpg")), MimeType::Png);
+    }
 }

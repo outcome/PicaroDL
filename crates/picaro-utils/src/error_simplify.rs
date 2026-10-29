@@ -112,9 +112,25 @@ pub fn simplify_error_message(input: &str) -> String {
         }
     }
 
-    if s.len() > 120 {
-        format!("{}...", &s[..117])
+    // Truncate on a char boundary: byte-slicing at 117 panicked on any
+    // message with a multi-byte character there (accented titles, CJK).
+    if s.chars().count() > 120 {
+        let cut: String = s.chars().take(117).collect();
+        format!("{cut}...")
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::simplify_error_message;
+
+    #[test]
+    fn long_messages_truncate_on_char_boundaries() {
+        let msg = "é".repeat(200);
+        let out = simplify_error_message(&msg);
+        assert!(out.ends_with("..."));
+        assert_eq!(out.chars().count(), 120);
     }
 }

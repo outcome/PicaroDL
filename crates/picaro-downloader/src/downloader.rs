@@ -1320,9 +1320,11 @@ impl Downloader {
                 Err(e) => {
                     failed += 1;
                     warn!("track {id} failed: {e}");
+                    // `name` is what a UI shows on the failed row: the
+                    // track's title, not its id (often a long URL).
                     let _ = self.events.0.send(DownloadEvent::TrackFailed {
                         track_id: id.to_string(),
-                        name: id.to_string(),
+                        name: item_name.clone(),
                         reason: simplify_error_message(&e.to_string()),
                     });
                 }
