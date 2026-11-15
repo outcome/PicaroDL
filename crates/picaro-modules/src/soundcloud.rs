@@ -8,6 +8,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use regex::Regex;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -24,7 +25,9 @@ const API_BASE: &str = "https://api-v2.soundcloud.com/";
 // fetch https://soundcloud.com/, download the a-v2.sndcdn.com asset JS
 // files and grep for `client_id:"<32 alnum>"`.
 // Refreshed 2026-09-13 (previous WU4b... id returns 401).
-const CLIENT_ID: &str = "Pb72ranhoyt6gw7hM7TkzUItXlMWSNSo";
+// Refreshed 2026-11-15; `scrape_client_id` re-fetches one at runtime on a 401.
+const CLIENT_ID: &str = "qLcgHhXgeEFFaSolTB9I71LBsqncsD93";
+static DYN_CLIENT_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// True when an API error looks like a 403/restricted response, mirroring the
 /// `_is_restricted` check in `soundcloud_api.py`.
@@ -109,14 +112,52 @@ impl SoundCloudSession {
         }
     }
 
+    /// Scrapes the live public client id out of the web player's asset JS
+    /// (the ids rotate every few weeks, so a pinned one rots). Cached for the
+    /// process; `None` when soundcloud.com can't be read.
+    async fn scrape_client_id(&self) -> Option<String> {
+        let html = self.client.get("https://soundcloud.com/").send().await.ok()?.text().await.ok()?;
+        let re_src = Regex::new(r#"src="(https://a-v2\.sndcdn\.com/assets/[^"]+\.js)""#).ok()?;
+        let re_id = Regex::new(r#"client_id[:=]"?([A-Za-z0-9]{32})"#).ok()?;
+        // The id lives in one of the last-listed bundles.
+        let urls: Vec<String> = re_src.captures_iter(&html).map(|c| c[1].to_string()).collect();
+        for u in urls.iter().rev() {
+            let Ok(r) = self.client.get(u).send().await else { continue };
+            let Ok(js) = r.text().await else { continue };
+            if let Some(c) = re_id.captures(&js) {
+                let id = c[1].to_string();
+                *DYN_CLIENT_ID.lock().unwrap() = Some(id.clone());
+                return Some(id);
+            }
+        }
+        None
+    }
+
     async fn api_get(
+        &self,
+        path_or_url: &str,
+        params: HashMap<String, String>,
+    ) -> Result<Value> {
+        match self.api_get_once(path_or_url, params.clone()).await {
+            Err(e) if format!("{e}").contains("(401)") && self.access_token.is_empty() => {
+                // Expired public client id: fetch a fresh one and retry once.
+                match self.scrape_client_id().await {
+                    Some(_) => self.api_get_once(path_or_url, params).await,
+                    None => Err(e),
+                }
+            }
+            r => r,
+        }
+    }
+
+    async fn api_get_once(
         &self,
         path_or_url: &str,
         mut params: HashMap<String, String>,
     ) -> Result<Value> {
-        params
-            .entry("client_id".to_string())
-            .or_insert_with(|| CLIENT_ID.to_string());
+        params.entry("client_id".to_string()).or_insert_with(|| {
+            DYN_CLIENT_ID.lock().unwrap().clone().unwrap_or_else(|| CLIENT_ID.to_string())
+        });
         let url = if path_or_url.starts_with("http") {
             path_or_url.to_string()
         } else {
@@ -713,6 +754,11 @@ impl SoundCloudModule {
             if url.is_empty() {
                 continue;
             }
+            // Label tracks (policy MONETIZE/SNIP) only stream a 30 s preview
+            // to anonymous clients; delivering it would be a truncated song.
+            if t.get("snipped").and_then(|v| v.as_bool()) == Some(true) {
+                continue;
+            }
             // Codec comes from the preset prefix (`mp3_*`, `aac_*`, `opus_*`),
             // not the container mime type (HLS AAC reports `audio/mpeg`).
             let preset = t
@@ -1000,17 +1046,6 @@ impl picaro_utils::module::ModuleInterface for SoundCloudModule {
             .bytes()
             .await
             .map_err(|e| Error::Other(format!("SoundCloud read: {e}")))?;
-        // If it looks like an m3u8 playlist, return as URL instead
-        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(64)]).to_string();
-        if head.contains("#EXTM3U") {
-            return Ok(TrackDownloadInfo {
-                download_type: DownloadSource::Url,
-                file_url: Some(stream_url),
-                file_url_headers: Default::default(),
-                temp_file_path: None,
-                different_codec: Some(codec),
-            });
-        }
         let ext = if codec.contains(CodecFlags::MP3) {
             "mp3"
         } else if codec.contains(CodecFlags::OPUS) {
@@ -1022,6 +1057,73 @@ impl picaro_utils::module::ModuleInterface for SoundCloudModule {
             std::env::temp_dir().join(format!("sc-{track_id}-{}.{}", std::process::id(), ext));
         let mut f =
             std::fs::File::create(&path).map_err(|e| Error::Other(format!("temp create: {e}")))?;
+        // An m3u8 playlist is only the table of contents (SoundCloud serves
+        // HLS only now): fetch the init segment + every media segment and
+        // concatenate them into one file (fMP4 for AAC, raw frames for MP3).
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(64)]).to_string();
+        if head.contains("#EXTM3U") {
+            let playlist = String::from_utf8_lossy(&bytes).to_string();
+            let base = reqwest::Url::parse(&stream_url)
+                .map_err(|e| Error::Other(format!("SoundCloud playlist url: {e}")))?;
+            let mut parts: Vec<String> = Vec::new();
+            for line in playlist.lines().map(str::trim) {
+                if let Some(rest) = line.strip_prefix("#EXT-X-MAP:") {
+                    if let Some(u) = rest.split("URI=\"").nth(1).and_then(|s| s.split('"').next()) {
+                        parts.push(u.to_string());
+                    }
+                } else if !line.is_empty() && !line.starts_with('#') {
+                    parts.push(line.to_string());
+                }
+            }
+            if parts.is_empty() {
+                return Err(Error::Other("SoundCloud: empty HLS playlist".to_string()));
+            }
+            for part in parts {
+                let url = base
+                    .join(&part)
+                    .map_err(|e| Error::Other(format!("SoundCloud segment url: {e}")))?;
+                let seg = client
+                    .get(url)
+                    .send()
+                    .await
+                    .and_then(|r| r.error_for_status())
+                    .map_err(|e| Error::Other(format!("SoundCloud segment: {e}")))?
+                    .bytes()
+                    .await
+                    .map_err(|e| Error::Other(format!("SoundCloud segment read: {e}")))?;
+                f.write_all(&seg)
+                    .map_err(|e| Error::Other(format!("temp write: {e}")))?;
+            }
+            drop(f);
+            // Concatenated fMP4 has no duration/seek table and trips some
+            // decoders; a stream-copy remux (when ffmpeg exists) fixes that.
+            if ext == "m4a" {
+                let out = path.with_extension("fixed.m4a");
+                let mut cmd = tokio::process::Command::new("ffmpeg");
+                cmd.args(["-y", "-v", "error", "-i"])
+                    .arg(&path)
+                    .args(["-c", "copy", "-movflags", "+faststart"])
+                    .arg(&out)
+                    .stdin(std::process::Stdio::null());
+                #[cfg(windows)]
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+                match cmd.status().await {
+                    Ok(s) if s.success() && out.metadata().map(|m| m.len() > 0).unwrap_or(false) => {
+                        let _ = std::fs::rename(&out, &path);
+                    }
+                    _ => {
+                        let _ = std::fs::remove_file(&out);
+                    }
+                }
+            }
+            return Ok(TrackDownloadInfo {
+                download_type: DownloadSource::TempFilePath,
+                file_url: None,
+                file_url_headers: Default::default(),
+                temp_file_path: Some(path),
+                different_codec: Some(codec),
+            });
+        }
         f.write_all(&bytes)
             .map_err(|e| Error::Other(format!("temp write: {e}")))?;
         Ok(TrackDownloadInfo {

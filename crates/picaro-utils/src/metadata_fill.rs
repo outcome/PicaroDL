@@ -417,10 +417,12 @@ pub async fn fill_track_metadata(
             title = name_clean[idx + 3..].trim().to_string();
         }
     }
-    let query = format!("{artist} {title}").trim().to_string();
-    if query.is_empty() {
+    // A title-only lookup grabs whichever popular song shares the title
+    // ("Monster" -> Shawn Mendes), so with no artist we leave the tags alone.
+    if artist.trim().is_empty() {
         return filled;
     }
+    let query = format!("{artist} {title}").trim().to_string();
 
     let need_name = missing(&info.name);
     let need_album = missing(&info.album);

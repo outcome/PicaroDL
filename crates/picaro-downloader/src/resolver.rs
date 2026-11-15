@@ -646,7 +646,12 @@ impl Resolver {
         let lossless_src = |s: &str| {
             matches!(
                 s,
-                "monochrome" | "technicaldeathmetal" | "coreradio" | "ektoplazm" | "relisten"
+                "monochrome"
+                    | "technicaldeathmetal"
+                    | "coreradio"
+                    | "ektoplazm"
+                    | "relisten"
+                    | "khinsider"
             )
         };
 
@@ -1404,6 +1409,21 @@ fn is_opus_provider(service: &str) -> bool {
     matches!(service, "youtube" | "soundcloud")
 }
 
+/// `s` without its `(...)` and `[...]` segments ("Halo (Live)" -> "Halo");
+/// falls back to `s` when nothing would be left.
+fn strip_brackets(s: &str) -> String {
+    let (mut out, mut depth) = (String::new(), 0i32);
+    for c in s.chars() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = (depth - 1).max(0),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    if out.trim().is_empty() { s.to_string() } else { out }
+}
+
 /// Score a search result against "artist - title" by token overlap.
 ///
 /// Hard gates (the "intro"/"sweet" incident): BOTH sides must score.
@@ -1428,6 +1448,19 @@ fn score_result(query: &str, r: &SearchResult) -> f64 {
         && !title_concat
     {
         return 0.0;
+    }
+    // "In The End" must not accept "Waiting For The End" by the same artist
+    // (artist match + two shared words scored 0.79, so the wrong song was
+    // delivered whenever the right one was missing): most of the title's
+    // words (ignoring "(...)"/"[...]" suffixes) must be present.
+    {
+        let core = strip_brackets(&qt);
+        if textmatch::token_presence(&core, &combined) < 0.75
+            && textmatch::token_presence(&core, name) < 0.75
+            && !textmatch::contains_fold(&combined, &core)
+        {
+            return 0.0;
+        }
     }
     match &qa {
         Some(a) => {
@@ -1464,7 +1497,11 @@ fn score_result(query: &str, r: &SearchResult) -> f64 {
             let s_full = textmatch::similarity(&full, &combined);
             let s_artist = textmatch::similarity(&qt, &artists);
             let s_title = textmatch::similarity(&qt, name);
-            s_full.max(s_artist).max(s_title)
+            // Mix/blog sources title things "Skepta Freestyle (prod. X) - show
+            // name": every query word present is a match even when the long
+            // title dilutes the similarity.
+            let all_words = if textmatch::token_presence(&qt, &combined) >= 1.0 { 0.6 } else { 0.0 };
+            s_full.max(s_artist).max(s_title).max(all_words)
         }
     }
 }
@@ -1553,6 +1590,25 @@ fn save_scores(path: &Path, scores: &HashMap<String, f64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hit(name: &str, artist: &str) -> SearchResult {
+        SearchResult {
+            name: Some(name.to_string()),
+            artists: Some(vec![artist.to_string()]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_different_song_by_the_same_artist_is_not_a_match() {
+        let q = "Linkin Park - In The End";
+        assert!(score_result(q, &hit("In the End", "Linkin Park")) >= 0.5);
+        assert!(score_result(q, &hit("In the End (Live)", "Linkin Park")) >= 0.5);
+        // shares "the end" + the artist but is another song
+        assert_eq!(score_result(q, &hit("Waiting For The End", "Linkin Park")), 0.0);
+        // bracketed query suffixes don't have to appear in the candidate
+        assert!(score_result("Radiohead - Creep (Remastered 2009)", &hit("Creep", "Radiohead")) >= 0.5);
+    }
 
     #[test]
     fn links_are_recognised_and_text_is_not() {

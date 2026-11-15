@@ -253,10 +253,25 @@ impl picaro_utils::module::ModuleInterface for Mod {
         _track_info: Option<&TrackInfo>,
         limit: u32,
     ) -> Result<Vec<SearchResult>> {
-        let url = format!("{BASE}/search?quicksearch=tracks&q={}", enc(query));
-        let html = fetch_page(&self.client, &url).await?;
+        // The site ignores `q=` (it answers with its default listing for any
+        // query); the live search parameter is `quicksearch=<terms>`.
+        // The site matches the whole phrase, so "Artist - Title" often finds
+        // nothing: fall back to the title part, then the artist part.
+        let mut terms = vec![query.replace(" - ", " ")];
+        if let Some((a, t)) = query.split_once(" - ") {
+            terms.push(t.trim().to_string());
+            terms.push(a.trim().to_string());
+        }
+        let mut links = Vec::new();
+        for term in terms {
+            let url = format!("{BASE}/search?quicksearch={}", enc(&term));
+            links = parse_track_links(&fetch_page(&self.client, &url).await?);
+            if !links.is_empty() {
+                break;
+            }
+        }
         let mut out = Vec::new();
-        for (track_url, name, artist) in parse_track_links(&html) {
+        for (track_url, name, artist) in links {
             let name = decode_entities(&name);
             let artist = decode_entities(&artist);
             if name.is_empty() {

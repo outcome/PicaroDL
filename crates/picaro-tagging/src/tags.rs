@@ -13,7 +13,7 @@ use lofty::file::AudioFile;
 use lofty::file::TaggedFileExt;
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::prelude::*;
-use lofty::tag::{ItemKey, Tag, TagType};
+use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
 
 use picaro_utils::error::{Error, Result};
 use picaro_utils::models::{Container, CreditsInfo, TrackInfo};
@@ -138,8 +138,11 @@ impl<'a> Tagger<'a> {
             tag.set_album(self.track.album.clone());
         }
         if self.split_metadata {
+            // `push`, not `insert_text`: insert replaces an existing item of
+            // the same key, so a "Knocked Loose; Emma Boster" track ended up
+            // tagged with the LAST artist only.
             for a in &self.track.artists {
-                tag.insert_text(ItemKey::TrackArtist, a.clone());
+                tag.push(TagItem::new(ItemKey::TrackArtist, ItemValue::Text(a.clone())));
             }
         } else {
             tag.set_artist(self.track.artists.join(self.metadata_separator));
@@ -200,7 +203,7 @@ impl<'a> Tagger<'a> {
             tag.remove_key(&ItemKey::Genre);
             if self.split_metadata {
                 for g in genres {
-                    tag.insert_text(ItemKey::Genre, g.clone());
+                    tag.push(TagItem::new(ItemKey::Genre, ItemValue::Text(g.clone())));
                 }
             } else {
                 tag.set_genre(genres.join(self.metadata_separator));
@@ -228,7 +231,10 @@ impl<'a> Tagger<'a> {
             tag.remove_key(&ItemKey::Unknown(credit.credit_type.clone()));
             if self.split_metadata {
                 for n in &credit.names {
-                    tag.insert_text(ItemKey::Unknown(credit.credit_type.clone()), n.clone());
+                    tag.push(TagItem::new(
+                        ItemKey::Unknown(credit.credit_type.clone()),
+                        ItemValue::Text(n.clone()),
+                    ));
                 }
             } else {
                 tag.insert_text(

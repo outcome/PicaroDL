@@ -88,7 +88,8 @@ fn decode_entities(s: &str) -> String {
     let quot = format!("{}quot;", '&');
     let raquo = format!("{}raquo;", '&');
     let laquo = format!("{}laquo;", '&');
-    s.replace("&#8211;", "-")
+    s.replace("&#038;", "&")
+        .replace("&#8211;", "-")
         .replace("&#8212;", "-")
         .replace("&#8217;", "'")
         .replace("&#8220;", "\"")

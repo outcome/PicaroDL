@@ -15,8 +15,8 @@ use picaro_utils::{ModuleConstructor, ModuleInterfacePtr};
 use crate::registry::register;
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const REFERER: &str = "https://a2.freemp3cloud.com/";
-const BASE: &str = "https://a2.freemp3cloud.com";
+const REFERER: &str = "https://b2.freemp3cloud.com/";
+const BASE: &str = "https://b2.freemp3cloud.com";
 
 pub fn module_information() -> ModuleInformation {
     ModuleInformation {
@@ -158,6 +158,9 @@ async fn run_search(client: &reqwest::Client, query: &str) -> Result<Vec<SearchR
             home.status()
         )));
     }
+    // The site hops hosts (a2 -> b2 on 2026-11-15); a POST to the old host is
+    // answered with the bare home page, so post where the home page landed.
+    let base = home.url().origin().ascii_serialization();
     let home_html = home
         .text()
         .await
@@ -165,8 +168,8 @@ async fn run_search(client: &reqwest::Client, query: &str) -> Result<Vec<SearchR
     let token = extract_token(&home_html)
         .ok_or_else(|| Error::Other("freemp3cloud: antiforgery token not found".to_string()))?;
     let resp = client
-        .post(BASE)
-        .header("Referer", REFERER)
+        .post(&base)
+        .header("Referer", format!("{base}/"))
         .form(&[
             ("searchSong", query),
             ("__RequestVerificationToken", token.as_str()),

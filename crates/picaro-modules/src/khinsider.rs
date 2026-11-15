@@ -91,8 +91,12 @@ async fn kh_fetch(url: &str) -> Result<String> {
     }
     #[cfg(feature = "cf-impersonate")]
     {
-        if let Ok(body) = crate::impersonate::impersonate_fetch(url).await {
-            return Ok(body);
+        // The site answers bursts with 429: back off and retry.
+        for attempt in 0..3u64 {
+            if let Ok(body) = crate::impersonate::impersonate_fetch(url).await {
+                return Ok(body);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(800 * (attempt + 1))).await;
         }
     }
     #[cfg(feature = "cf-webview")]
@@ -150,12 +154,12 @@ fn parse_track_rows(html: &str) -> Vec<(String, String)> {
 
 /// Direct CDN file URL from a rendered per-track page (FLAC preferred).
 fn parse_cdn_link(html: &str) -> Option<(String, CodecFlags)> {
-    let flac = Regex::new(r#"https://[a-z0-9.]+\.vgmtreasurechest\.com/soundtracks/[^"'\s<>]+?\.flac"#)
+    let flac = Regex::new(r#"https://(?:[a-z0-9.]+\.)?vgmtreasurechest\.com/soundtracks/[^"'\s<>]+?\.flac"#)
         .unwrap();
     if let Some(m) = flac.find(html) {
         return Some((m.as_str().to_string(), CodecFlags::FLAC));
     }
-    let mp3 = Regex::new(r#"https://[a-z0-9.]+\.vgmtreasurechest\.com/soundtracks/[^"'\s<>]+?\.mp3"#)
+    let mp3 = Regex::new(r#"https://(?:[a-z0-9.]+\.)?vgmtreasurechest\.com/soundtracks/[^"'\s<>]+?\.mp3"#)
         .unwrap();
     // The page also embeds a preview <audio> for the same file; either
     // occurrence is the real track.
@@ -427,7 +431,7 @@ impl picaro_utils::module::ModuleInterface for Mod {
 
     async fn search(
         &self,
-        _query_type: DownloadType,
+        query_type: DownloadType,
         query: &str,
         _track_info: Option<&TrackInfo>,
         limit: u32,
@@ -438,16 +442,19 @@ impl picaro_utils::module::ModuleInterface for Mod {
         // a few seconds, and three sequential fetches blow that window.
         let mut candidates: Vec<String> = vec![query.replace(" - ", " ")];
         if let Some(i) = query.find(" - ") {
-            candidates.push(query[i + 3..].to_string());
+            // Game name (the "artist" part) before the track title: bare
+            // titles like "Main Theme" match dozens of unrelated albums and
+            // would fill the result limit first.
             candidates.push(query[..i].to_string());
+            candidates.push(query[i + 3..].to_string());
         }
-        let client = self.client.clone();
         let mut handles = Vec::new();
         for cand in candidates {
-            let client = client.clone();
             handles.push(tokio::spawn(async move {
+                // Search now sits behind the same Cloudflare TLS check as the
+                // album pages (403 to a plain client as of 2026-11-15).
                 let url = format!("{BASE}/search?search={}", enc(&cand));
-                fetch_plain(&client, &url).await
+                kh_fetch(&url).await
             }));
         }
         let mut out: Vec<SearchResult> = Vec::new();
@@ -479,11 +486,57 @@ impl picaro_utils::module::ModuleInterface for Mod {
                     ..Default::default()
                 });
             }
-            if out.len() >= limit.clamp(1, 50) as usize {
-                break;
+        }
+        let all = out.clone();
+        out.truncate(limit.clamp(1, 50) as usize);
+        // A "Game - Track" query names a track, but the site only lists
+        // albums, so the resolver's title gate rejects every album name.
+        // Open the best-matching albums and return their matching TRACKS
+        // (per-track page urls resolve through `resolve_cdn_url` step 2).
+        if matches!(query_type, DownloadType::track) {
+            if let Some((game, title)) = query.split_once(" - ") {
+                // Shortest names first: "Undertale" -> "Undertale Soundtrack"
+                // before the fan albums that also mention it.
+                let mut cands: Vec<&SearchResult> = all
+                    .iter()
+                    .filter(|r| {
+                        let n = r.name.as_deref().unwrap_or_default();
+                        n.to_lowercase().contains(&game.trim().to_lowercase())
+                            || textmatch::similarity(game, n) >= 0.5
+                    })
+                    .collect();
+                cands.sort_by_key(|r| r.name.as_deref().map_or(0, str::len));
+                let albums: Vec<(String, String)> = cands
+                    .into_iter()
+                    .take(6)
+                    .map(|r| {
+                        (
+                            r.result_id.split('#').next().unwrap_or_default().to_string(),
+                            r.name.clone().unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                let pages = futures::future::join_all(albums.iter().map(|(u, _)| kh_fetch(u))).await;
+                let mut tracks = Vec::new();
+                for ((_, album), page) in albums.iter().zip(pages) {
+                    let Ok(html) = page else { continue };
+                    for (url, name) in parse_track_rows(&html) {
+                        if textmatch::similarity(title.trim(), &name) >= 0.6 {
+                            tracks.push(SearchResult {
+                                result_id: url,
+                                name: Some(name),
+                                artists: Some(vec![album.clone()]),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+                if !tracks.is_empty() {
+                    tracks.truncate(limit.clamp(1, 50) as usize);
+                    return Ok(tracks);
+                }
             }
         }
-        out.truncate(limit.clamp(1, 50) as usize);
         Ok(out)
     }
 }

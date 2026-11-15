@@ -65,6 +65,26 @@ answer beats a plain one, ranked by `ORDER` there.
 - Testing tip: the CLI bin is the `picaro` package (`cargo build -p picaro`), NOT
   `picaro-tui`; building the wrong one leaves a stale `target/debug/picaro.exe`.
 
+## Source audit 2026-11-15 (all sources re-tested with `get --only <svc>`)
+Test sequentially: parallel runs trigger 429s/timeouts that look like breakage.
+Fixed this round: SoundCloud (client_id rotated -> constant + runtime scrape from a-v2.sndcdn.com
+JS; only HLS now: segments concatenated + ffmpeg remux; `snipped` previews skipped),
+FreeMp3Cloud (host moved a2 -> b2), FMA (search param `quicksearch=`), Khinsider (search
+behind Cloudflare TLS check -> impersonate fetch with 429 retry; track queries open the best
+matching albums and return per-TRACK results; CDN host is now bare `vgmtreasurechest.com`;
+added to `lossless_src`), systemsofromance (`&#038;` in names), multi-artist tags
+(`push` not `insert_text`), resolver title gate (wrong song by same artist no longer matches),
+artist-less downloads no longer get a title-only Deezer/iTunes/MB lookup (wrong artist).
+Working: monochrome, youtube, soundcloud, freemp3cloud, zvu4it, tancpol, ccmixter,
+certifiedmixtapez, mixtapemonkey (some tapes removed upstream), fma, globaldjmix, tomlehrer,
+onetrance, ezhevika, testpressing, soulseek, ektoplazm, khinsider (FLAC when the album has it;
+MP3-only albums are rejected for lossless), dancemusicorg, fondsound, systemsofromance, butterboy,
+mp3zona (search only finds some titles). Lyrics: Unison, BetterLyrics, LyricsPlus, BiniLyrics,
+LrcRed, KuGou OK; Lyrist 403 (dead), Musixmatch empty.
+Broken upstream: punkcata (archive.org links 404), mp3tut (CDN link 400), grimearchive (search
+OK, mix S3 files 404 for the ones tried), coreradio (some VK files empty), relisten/
+technicaldeathmetal (MP3 only / no direct archive), internetarchive (poor search).
+
 ## Candidate sources to add next (from FMHY, live-tested)
 Ranked; none implemented yet.
 
