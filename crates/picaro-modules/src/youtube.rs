@@ -357,6 +357,25 @@ fn ytm_runs_text(col: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The artist of a result row's second column. An UNFILTERED search leads
+/// that column with the item's type ("Song \u{2022} Artist \u{2022} Album",
+/// "Video \u{2022} Channel \u{2022} 1M views"), which used to be taken as the
+/// artist, so every hit scored as by an artist called "Song" / "Video".
+fn ytm_artist_run(col: &Value) -> Option<String> {
+    const KINDS: [&str; 7] = ["Song", "Video", "Single", "EP", "Album", "Playlist", "Artist"];
+    let runs = col
+        .pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs")?
+        .as_array()?;
+    let mut parts = runs
+        .iter()
+        .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && *t != "\u{2022}");
+    let first = parts.next()?;
+    let artist = if KINDS.contains(&first) { parts.next() } else { Some(first) };
+    artist.map(|a| a.to_string())
+}
+
 fn parse_mmss(s: &str) -> Option<u32> {
     let parts: Vec<&str> = s.trim().split(':').collect();
     match parts.as_slice() {
@@ -371,7 +390,7 @@ fn parse_mmss(s: &str) -> Option<u32> {
 fn parse_ytm_item(item: &Value) -> Option<SearchResult> {
     let flex = item.get("flexColumns")?.as_array()?;
     let title = flex.first().and_then(ytm_runs_text)?;
-    let artist = flex.get(1).and_then(ytm_runs_text);
+    let artist = flex.get(1).and_then(ytm_artist_run);
     let album = flex.get(2).and_then(ytm_runs_text);
     let video_id = item
         .pointer("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint/watchEndpoint/videoId")
@@ -433,11 +452,44 @@ fn collect_ytm(v: &Value, out: &mut Vec<SearchResult>, limit: usize) {
 /// Search YouTube Music via YouTube's public InnerTube API (the approach the
 /// InnerTune client uses). Returns real songs (title/artist/album/duration)
 /// instead of raw video titles. No login required.
+///
+/// A bare "Artist Title" query is not enough: YouTube Music reads it as the
+/// artist and returns that artist's popular songs, burying a track whose
+/// title it ranks lower (Jiinzo - Silver Spoon came back as five OTHER Jiinzo
+/// songs). So the query runs three ways at once and the results are merged,
+/// de-duplicated, best shelf first: its Songs filter, the plain search, and -
+/// for "Artist - Title" - the title-first order, which surfaces the track
+/// and its upload.
 async fn ytm_search(query: &str, limit: u32) -> Result<Vec<SearchResult>> {
-    let (v, len) = ytm_request(query, None).await?;
-    let mut out = Vec::new();
-    collect_ytm(&v, &mut out, limit as usize);
-    tracing::info!("ytmusic search '{query}': len={len} items={}", out.len());
+    let plain = query.replace(" - ", " ");
+    let swapped = query
+        .split_once(" - ")
+        .map(|(artist, title)| format!("{} {}", title.trim(), artist.trim()));
+    let (songs, base, swap) = tokio::join!(
+        ytm_request(&plain, Some(YTM_SONGS_FILTER)),
+        ytm_request(query, None),
+        async {
+            match &swapped {
+                Some(q) => Some(ytm_request(q, None).await),
+                None => None,
+            }
+        }
+    );
+    // A transport error on one shelf is only a miss when another answered.
+    if songs.is_err() && base.is_err() && swap.as_ref().is_none_or(|s| s.is_err()) {
+        return base.map(|_| Vec::new());
+    }
+    let mut out: Vec<SearchResult> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let replies = [Some(songs), Some(base), swap];
+    for (label, reply) in ["songs", "plain", "swapped"].iter().zip(replies) {
+        let Some(Ok((v, len))) = reply else { continue };
+        let mut part = Vec::new();
+        collect_ytm(&v, &mut part, limit as usize);
+        tracing::info!("ytmusic {label} search '{query}': len={len} items={}", part.len());
+        out.extend(part.into_iter().filter(|r| seen.insert(r.result_id.clone())));
+    }
+    out.truncate(limit as usize);
     Ok(out)
 }
 
@@ -487,6 +539,8 @@ async fn ytm_request(query: &str, params: Option<&str>) -> Result<(Value, usize)
 /// is one shelf of album / EP / single rows, each carrying its auto-generated
 /// `OLAK5uy_` playlist (the id yt-dlp can read as an album).
 const YTM_ALBUMS_FILTER: &str = "EgWKAQIYAWoKEAkQBRAKEAMQBA==";
+/// The same blob pinned to the Songs shelf.
+const YTM_SONGS_FILTER: &str = "EgWKAQIIAWoKEAkQBRAKEAMQBA==";
 
 /// One YouTube Music album row as a search result. The result id is the
 /// row's `OLAK5uy_` playlist id: `get_album_info` hands it to the playlist
@@ -1207,6 +1261,24 @@ pub fn register_module(registry: &picaro_utils::ModuleRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flex_col(runs: &[&str]) -> Value {
+        json!({ "musicResponsiveListItemFlexColumnRenderer": { "text": {
+            "runs": runs.iter().map(|t| json!({ "text": t })).collect::<Vec<_>>()
+        }}})
+    }
+
+    #[test]
+    fn result_rows_take_the_artist_not_the_item_type() {
+        // Unfiltered search leads with the type label; the Songs shelf does not.
+        let song = flex_col(&["Song", " \u{2022} ", "Jiinzo", " \u{2022} ", "Silver Spoon", " \u{2022} ", "2:51"]);
+        let video = flex_col(&["Video", " \u{2022} ", "Jiinzo", " \u{2022} ", "1.2M views"]);
+        let shelf = flex_col(&["Jiinzo", " & ", "Friend", " \u{2022} ", "Silver Spoon"]);
+        assert_eq!(ytm_artist_run(&song).as_deref(), Some("Jiinzo"));
+        assert_eq!(ytm_artist_run(&video).as_deref(), Some("Jiinzo"));
+        assert_eq!(ytm_artist_run(&shelf).as_deref(), Some("Jiinzo"));
+        assert_eq!(ytm_artist_run(&flex_col(&["Song"])), None);
+    }
 
     #[test]
     fn playlist_albums_take_the_artist_from_the_title_not_the_uploader() {

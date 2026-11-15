@@ -21,7 +21,9 @@ pub mod internetarchive;
 #[cfg(feature = "cf-impersonate")]
 pub mod khinsider;
 pub mod lrclib;
+pub mod lyrics_kit;
 pub mod lyrics_ovh;
+pub mod lyrics_providers;
 pub mod lyrist;
 pub mod mixtapemonkey;
 pub mod musixmatch;

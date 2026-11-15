@@ -962,30 +962,70 @@ impl Downloader {
             "__track_name__".to_string(),
             Value::String(track.name.clone()),
         );
-        for name in self.picaro.list_modules() {
-            let is_lyrics = self
-                .picaro
-                .registry()
-                .get(&name)
-                .map(|m| {
-                    m.information
-                        .module_supported_modes
-                        .contains(ModuleModes::lyrics)
-                })
-                .unwrap_or(false);
-            if !is_lyrics {
-                continue;
-            }
-            if let Ok(module) = self.picaro.load_module(&name).await {
-                if let Ok(ly) = module.get_track_lyrics("", data.clone()).await {
-                    if ly.embedded.is_some() || ly.synced.is_some() {
-                        debug!("lyrics from provider {name}");
-                        return Some(ly);
-                    }
-                }
-            }
+        // Album + length sharpen the match for providers that take them.
+        data.insert("__album__".to_string(), Value::String(track.album.clone()));
+        if let Some(d) = track.duration.filter(|d| *d > 0) {
+            data.insert("__duration__".to_string(), Value::from(d));
         }
-        None
+        // The registry is a HashMap, so its order is arbitrary: rank the
+        // providers instead (timed sources first, scrapers last), ask them all
+        // at once, and take the best-ranked TIMED answer, else the best-ranked
+        // plain one.
+        const ORDER: [&str; 9] = [
+            "lrclib",
+            "unison",
+            "betterlyrics",
+            "lyricsplus",
+            "binilyrics",
+            "lrcred",
+            "kugou",
+            "musixmatch",
+            "lyrist",
+        ];
+        let rank = |n: &str| match ORDER.iter().position(|o| *o == n) {
+            Some(i) => i,
+            None => ORDER.len() + 1,
+        };
+        let mut names: Vec<String> = self
+            .picaro
+            .list_modules()
+            .into_iter()
+            .filter(|name| {
+                self.picaro
+                    .registry()
+                    .get(name)
+                    .map(|m| {
+                        m.information
+                            .module_supported_modes
+                            .contains(ModuleModes::lyrics)
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        names.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+        let answers = join_all(names.iter().map(|name| {
+            let data = data.clone();
+            async move {
+                let module = self.picaro.load_module(name).await.ok()?;
+                let ly = tokio::time::timeout(
+                    std::time::Duration::from_secs(12),
+                    module.get_track_lyrics("", data),
+                )
+                .await
+                .ok()?
+                .ok()?;
+                (ly.embedded.is_some() || ly.synced.is_some()).then_some((name.clone(), ly))
+            }
+        }))
+        .await;
+        let answers: Vec<(String, picaro_utils::models::LyricsInfo)> =
+            answers.into_iter().flatten().collect();
+        let best = answers
+            .iter()
+            .find(|(_, ly)| ly.synced.is_some())
+            .or_else(|| answers.first())?;
+        debug!("lyrics from provider {}", best.0);
+        Some(best.1.clone())
     }
 
     /// Optionally transcode a finished file to a target codec/bitrate via

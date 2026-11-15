@@ -124,6 +124,7 @@ pub fn register_all(registry: &ModuleRegistry) -> Result<()> {
     #[cfg(feature = "cf-impersonate")]
     crate::khinsider::register_module(registry);
     crate::lrclib::register_module(registry);
+    crate::lyrics_providers::register_all(registry);
     crate::lyrics_ovh::register_module(registry);
     crate::lyrist::register_module(registry);
     crate::mixtapemonkey::register_module(registry);
