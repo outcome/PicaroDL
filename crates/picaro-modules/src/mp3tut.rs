@@ -112,35 +112,36 @@ fn parse_handler_links(html: &str) -> Vec<String> {
     out
 }
 
-/// Direct file URL from a `/check/<slug>` page's `data-id` attribute.
-/// Prefers same-host `/media/...mp3` paths; falls back to CDN tokens.
+/// Direct file URL from a `/check/<slug>` page's `data-id` attribute. The
+/// FIRST one is the requested song; the `/media/...mp3` ones after it are the
+/// page's unrelated "more tracks" list (taking one of those once downloaded
+/// the wrong song under the right name).
 fn parse_data_id(html: &str) -> Option<String> {
     let re = Regex::new(r#"data-id="([^"]+)""#).unwrap();
-    let mut fallback: Option<String> = None;
     for cap in re.captures_iter(html) {
         let raw = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
         let raw = raw.trim_end_matches('\\');
-        if raw.is_empty() {
-            continue;
+        if raw.starts_with('/') {
+            return Some(format!("{BASE}{raw}"));
         }
-        if raw.contains("/media/music/") && raw.ends_with(".mp3") {
-            let url = if raw.starts_with("http") {
-                raw.to_string()
-            } else {
-                format!("{BASE}{}", raw)
-            };
-            return Some(url);
-        }
-        if fallback.is_none() && (raw.starts_with("http") || raw.starts_with('/')) {
-            let url = if raw.starts_with('/') {
-                format!("{BASE}{raw}")
-            } else {
-                raw.to_string()
-            };
-            fallback = Some(url);
+        if raw.starts_with("http") {
+            return Some(raw.to_string());
         }
     }
-    fallback
+    None
+}
+
+/// "Artist - Title" of the requested song from a `/check/` page.
+fn parse_check_title(html: &str) -> Option<String> {
+    let re = Regex::new(r"(?s)<b>([^<]+)</b>\s*<strong>([^<]+)</strong>").unwrap();
+    let c = re.captures(html)?;
+    Some(format!("{} - {}", c[1].trim(), c[2].trim()))
+}
+
+/// Result titles on a search page, in the same order as its handler links.
+fn parse_result_titles(html: &str) -> Vec<String> {
+    let re = Regex::new(r#"<span class="artist_name">([^<]+)</span>"#).unwrap();
+    re.captures_iter(html).map(|c| c[1].trim().to_string()).collect()
 }
 
 fn name_from_slug(url: &str) -> String {
@@ -179,7 +180,7 @@ impl picaro_utils::module::ModuleInterface for Mod {
                 .rsplit('/')
                 .next()
                 .unwrap_or("");
-            (mp3, slug.replace('-', " "))
+            (mp3, parse_check_title(&html).unwrap_or_else(|| slug.replace('-', " ")))
         };
         Ok(TrackInfo {
             name,
@@ -285,13 +286,14 @@ impl picaro_utils::module::ModuleInterface for Mod {
         // caller's limit.
         let fetch_cap = max.min(10);
         let mut out = Vec::new();
-        for handler in parse_handler_links(&html) {
+        let titles = parse_result_titles(&html);
+        for (i, handler) in parse_handler_links(&html).into_iter().enumerate() {
             if out.len() >= fetch_cap {
                 break;
             }
-            // The handler URL contains the QUERY, not the song name.
-            // Follow the redirect to /check/<song-slug> and use that as
-            // the result name; also verify the page has a download link.
+            // The handler URL and its /check/ slug both echo the QUERY, so
+            // the real title is the one the search page lists for this row;
+            // the page must still have a download link.
             let Ok((page, final_url)) = fetch_tracked(&self.client, &handler).await else {
                 continue;
             };
@@ -302,10 +304,19 @@ impl picaro_utils::module::ModuleInterface for Mod {
                 .trim_end_matches('/')
                 .rsplit('/')
                 .next()
-                .unwrap_or("");
+                .unwrap_or("")
+                .replace('-', " ");
+            // "Artist - Title": give the artist its own field so the resolver
+            // rejects a same-title / different-artist row ("Lifeendz - Silver Spoon").
+            let full = titles.get(i).cloned().unwrap_or(slug);
+            let (artist, name) = match full.split_once(" - ") {
+                Some((a, t)) => (Some(vec![a.trim().to_string()]), t.trim().to_string()),
+                None => (None, full),
+            };
             out.push(SearchResult {
                 result_id: handler,
-                name: Some(slug.replace('-', " ")),
+                name: Some(name),
+                artists: artist,
                 ..Default::default()
             });
         }
@@ -315,4 +326,19 @@ impl picaro_utils::module::ModuleInterface for Mod {
 
 pub fn register_module(registry: &picaro_utils::ModuleRegistry) {
     register(registry, module_information(), constructor());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn main_track_beats_the_more_tracks_list() {
+        let html = r#"<b>Jiinzo</b>
+ <strong>Silver Spoon</strong>
+ <div data-id="https://cdn.mp3-tut.click/?h=MAIN\">
+ <div data-id="/media/music/45/1_x.mp3">"#;
+        assert_eq!(parse_data_id(html).unwrap(), "https://cdn.mp3-tut.click/?h=MAIN");
+        assert_eq!(parse_check_title(html).unwrap(), "Jiinzo - Silver Spoon");
+    }
 }
