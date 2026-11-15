@@ -189,6 +189,8 @@ impl Resolver {
                 // hung transfer or dead swarm must never sit in front of
                 // a working HTTP source. Torrents (piratebay/darktorrent)
                 // are appended after this list when [torrent] enabled.
+                // The broadest mainstream FLAC catalogue: first.
+                "monochrome",
                 "technicaldeathmetal",
                 "coreradio",
                 "ektoplazm",
@@ -644,7 +646,7 @@ impl Resolver {
         let lossless_src = |s: &str| {
             matches!(
                 s,
-                "technicaldeathmetal" | "coreradio" | "ektoplazm" | "relisten"
+                "monochrome" | "technicaldeathmetal" | "coreradio" | "ektoplazm" | "relisten"
             )
         };
 
@@ -1392,6 +1394,7 @@ fn is_direct_track(service: &str) -> bool {
             | "mp3tut"
             | "soulseek"
             | "khinsider"
+            | "monochrome"
     )
 }
 

@@ -129,14 +129,20 @@ pub async fn download_to_path(
     let has_ua = headers
         .as_ref()
         .map_or(false, |h| h.contains_key(reqwest::header::USER_AGENT));
-    let mut req = client.get(url);
-    if let Some(h) = headers {
-        req = req.headers(h);
-    }
-    if !has_ua {
-        req = req.header(reqwest::header::USER_AGENT, BROWSER_UA);
-    }
-    let mut resp = req.send().await?.error_for_status()?;
+    let build = |from: Option<u64>| {
+        let mut req = client.get(url);
+        if let Some(h) = &headers {
+            req = req.headers(h.clone());
+        }
+        if !has_ua {
+            req = req.header(reqwest::header::USER_AGENT, BROWSER_UA);
+        }
+        if let Some(b) = from {
+            req = req.header(reqwest::header::RANGE, format!("bytes={b}-"));
+        }
+        req
+    };
+    let mut resp = build(None).send().await?.error_for_status()?;
     let total = resp.content_length().unwrap_or(0);
     progress.report(0, total);
     // Download to "<dest>.part" and rename on completion, so an
@@ -153,11 +159,31 @@ pub async fn download_to_path(
     let transfer = async {
         let mut file = fs::File::create(&part).await?;
         let mut bytes: u64 = 0;
-        while let Some(chunk) = resp.chunk().await? {
-            file.write_all(&chunk).await?;
-            bytes += chunk.len() as u64;
-            progress.update(chunk.len() as u64);
-            progress.report(bytes, total);
+        let mut resumes = 0u64;
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    file.write_all(&chunk).await?;
+                    bytes += chunk.len() as u64;
+                    progress.update(chunk.len() as u64);
+                    progress.report(bytes, total);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    // A CDN dropping the stream mid-file (Cloudflare 521s,
+                    // resets) resumes where it stopped when the host honours
+                    // `Range` (206); anything else fails as before.
+                    if total == 0 || bytes == 0 || bytes >= total || resumes >= 3 {
+                        return Err(e.into());
+                    }
+                    resumes += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(1000 * resumes)).await;
+                    match build(Some(bytes)).send().await {
+                        Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT => resp = r,
+                        _ => return Err(e.into()),
+                    }
+                }
+            }
         }
         file.flush().await?;
         picaro_utils::error::Result::Ok(bytes)

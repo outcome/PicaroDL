@@ -33,6 +33,7 @@ pub mod onetrance;
 pub mod piratebay;
 pub mod punkcata;
 pub mod registry;
+pub mod monochrome;
 pub mod relisten;
 pub mod soulseek;
 pub mod soundcloud;

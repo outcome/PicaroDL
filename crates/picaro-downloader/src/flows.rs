@@ -282,7 +282,7 @@ pub fn album_served_tier(info: &AlbumInfo, service: &str) -> QualityTier {
         return QualityTier::Lossless;
     }
     match service {
-        "technicaldeathmetal" | "coreradio" | "ektoplazm" | "relisten" | "khinsider" => {
+        "monochrome" | "technicaldeathmetal" | "coreradio" | "ektoplazm" | "relisten" | "khinsider" => {
             QualityTier::Lossless
         }
         "youtube" | "soundcloud" => QualityTier::Low,

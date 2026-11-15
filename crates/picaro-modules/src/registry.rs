@@ -128,6 +128,7 @@ pub fn register_all(registry: &ModuleRegistry) -> Result<()> {
     crate::lyrics_ovh::register_module(registry);
     crate::lyrist::register_module(registry);
     crate::mixtapemonkey::register_module(registry);
+    crate::monochrome::register_module(registry);
     crate::musixmatch::register_module(registry);
     crate::mp3tut::register_module(registry);
     crate::mp3zona::register_module(registry);
