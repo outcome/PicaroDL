@@ -122,7 +122,7 @@ crossbeam-channel = "0.5"
 sevenz-rust = "0.6"
 
 # bittorrent (default off at runtime)
-librqbit = { version = "8", default-features = false, features = ["default-tls"] }
+librqbit = { version = "8", default-features = false, features = ["rust-tls"] }  # rustls: native-tls (OpenSSL) does not link next to wreq's BoringSSL on Linux
 
 # zip extraction
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
@@ -140,3 +140,8 @@ panic = "abort"
 [profile.dev]
 opt-level = 0
 debug = 1
+
+# mega 0.8 (unmaintained) turns on reqwest's default-tls = OpenSSL via native-tls, which fails to link on
+# Linux next to wreq's BoringSSL. vendor/mega is mega 0.8.0 unchanged except reqwest uses rustls.
+[patch.crates-io]
+mega = { path = "vendor/mega" }
